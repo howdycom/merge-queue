@@ -186,7 +186,7 @@ runs:
 
         # Build final payload with channel using jq
         PAYLOAD=$(jq -n \
-          --arg channel "${{ inputs.channel_id }}" \
+          --arg channel "$CHANNEL_ID" \
           --argjson blocks "$BLOCKS" \
           '{
             "channel": $channel,
@@ -201,8 +201,7 @@ runs:
           exit 1
         fi
 
-        # Send to Slack using Web API
-        BOT_TOKEN="${{ inputs.bot_token }}"
+        # Send to Slack using Web API (BOT_TOKEN already set via env:)
         RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
           -H "Authorization: Bearer ${BOT_TOKEN}" \
           -H 'Content-type: application/json' \

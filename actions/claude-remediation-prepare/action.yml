@@ -32,7 +32,7 @@ inputs:
       postinstall hook, Makefile target, or build hook here would run with repository secrets
       before human review.
     required: false
-    default: 'Makefile,package.json,pyproject.toml,uv.lock,poetry.lock,package-lock.json,requirements.txt,conftest.py,setup.py,.npmrc'
+    default: 'Makefile,makefile,GNUmakefile,package.json,pyproject.toml,uv.lock,poetry.lock,package-lock.json,requirements.txt,conftest.py,setup.py,.npmrc'
 outputs:
   enabled:
     description: '"true" if remediation should proceed, "false" if the trigger was skipped.'

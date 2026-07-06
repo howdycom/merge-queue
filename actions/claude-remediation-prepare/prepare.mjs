@@ -38,7 +38,7 @@ const SENSITIVE_PATH_PREFIXES = (
 const SENSITIVE_FILE_NAMES = new Set(
   (
     process.env.CLAUDE_REMEDIATION_SENSITIVE_FILE_NAMES ||
-    'Makefile,package.json,pyproject.toml,uv.lock,poetry.lock,package-lock.json,requirements.txt,conftest.py,setup.py,.npmrc'
+    'Makefile,makefile,GNUmakefile,package.json,pyproject.toml,uv.lock,poetry.lock,package-lock.json,requirements.txt,conftest.py,setup.py,.npmrc'
   )
     .split(',')
     .map((name) => name.trim())
