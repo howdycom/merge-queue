@@ -27,6 +27,24 @@ const SENSITIVE_PATH_PREFIXES = (
   .map((prefix) => prefix.trim())
   .filter(Boolean)
 
+// Build-tooling manifests are blocked by basename (not prefix) because they can
+// appear at any depth (e.g. matching-app/package.json). This matters because the
+// calling workflow typically instructs Claude (and its own post-processing steps)
+// to run the repo's own test/build/format commands (make test, uv run pytest,
+// npm ci, npm run build, ...) against the checked-out PR head. A PR that plants a
+// malicious postinstall hook, Makefile target, or PEP 517 build hook in one of
+// these files gets it executed with repo secrets the moment remediation runs,
+// independent of whether the LLM itself is prompt-injected.
+const SENSITIVE_FILE_NAMES = new Set(
+  (
+    process.env.CLAUDE_REMEDIATION_SENSITIVE_FILE_NAMES ||
+    'Makefile,makefile,GNUmakefile,package.json,pyproject.toml,uv.lock,poetry.lock,package-lock.json,requirements.txt,conftest.py,setup.py,.npmrc'
+  )
+    .split(',')
+    .map((name) => name.trim())
+    .filter(Boolean),
+)
+
 function ghText(args) {
   return execFileSync('gh', args, {
     encoding: 'utf-8',
@@ -90,9 +108,11 @@ function isProtectedHeadBranch(branchName) {
 }
 
 function touchesSensitivePaths(files) {
-  return files.some((entry) =>
-    SENSITIVE_PATH_PREFIXES.some((prefix) => String(entry?.path || '').startsWith(prefix)),
-  )
+  return files.some((entry) => {
+    const filePath = String(entry?.path || '')
+    if (SENSITIVE_PATH_PREFIXES.some((prefix) => filePath.startsWith(prefix))) return true
+    return SENSITIVE_FILE_NAMES.has(path.basename(filePath))
+  })
 }
 
 function buildRemediationBranch(prNumber, runId, runAttempt) {
@@ -253,9 +273,11 @@ async function prepare() {
   if (touchesSensitivePaths(pr.files || [])) {
     writeDisabled(
       'Claude remediation will not run on PRs that modify sensitive paths ' +
-        `(${SENSITIVE_PATH_PREFIXES.join(', ')}). The nested remediation PR's base is this PR's ` +
-        'own head branch, so unreviewed changes there could run with repository secrets before ' +
-        'a human reviews them.',
+        `(${SENSITIVE_PATH_PREFIXES.join(', ')}) or build-tooling files ` +
+        `(${[...SENSITIVE_FILE_NAMES].join(', ')}). The nested remediation PR's base is this PR's ` +
+        "own head branch, and remediation runs the repo's own test/build/format commands, so " +
+        'unreviewed changes to these files could run with repository secrets before a human ' +
+        'reviews them.',
       trigger.prNumber,
     )
     return

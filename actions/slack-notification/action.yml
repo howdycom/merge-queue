@@ -57,9 +57,22 @@ runs:
 
     - name: Generate and send Slack notification
       shell: bash
+      env:
+        ACTOR: ${{ inputs.actor }}
+        BOT_TOKEN: ${{ inputs.bot_token }}
+        CHANNEL_ID: ${{ inputs.channel_id }}
+        COMMIT_MESSAGE: ${{ inputs.commit_message }}
+        COMMIT_SHA: ${{ inputs.commit_sha }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        ERROR_MESSAGE: ${{ inputs.error_message }}
+        REPOSITORY: ${{ inputs.repository }}
+        SERVICES: ${{ inputs.services }}
+        STATUS: ${{ inputs.status }}
+        WORKFLOW_NAME: ${{ inputs.workflow_name }}
+        WORKFLOW_RUN_URL: ${{ inputs.workflow_run_url }}
       run: |
         # Determine emoji and title based on status
-        case "${{ inputs.status }}" in
+        case "$STATUS" in
           success)
             EMOJI="✅"
             TITLE="Run Successful"
@@ -75,25 +88,25 @@ runs:
         esac
 
         # Truncate strings before passing to jq
-        SHORT_SHA=$(echo "${{ inputs.commit_sha }}" | cut -c1-7)
-        COMMIT_MSG=$(echo "${{ inputs.commit_message }}" | head -c 100)
-        ERROR_MSG=$(echo "${{ inputs.error_message }}" | head -c 1000)
+        SHORT_SHA=$(echo "$COMMIT_SHA" | cut -c1-7)
+        COMMIT_MSG=$(echo "$COMMIT_MESSAGE" | head -c 100)
+        ERROR_MSG=$(echo "$ERROR_MESSAGE" | head -c 1000)
 
         # Build blocks array using jq for proper JSON construction
         BLOCKS=$(jq -n \
           --arg emoji "$EMOJI" \
           --arg title "$TITLE" \
-          --arg env "${{ inputs.environment }}" \
-          --arg workflow "${{ inputs.workflow_name }}" \
-          --arg services "${{ inputs.services }}" \
-          --arg commit_sha "${{ inputs.commit_sha }}" \
+          --arg env "$ENVIRONMENT" \
+          --arg workflow "$WORKFLOW_NAME" \
+          --arg services "$SERVICES" \
+          --arg commit_sha "$COMMIT_SHA" \
           --arg short_sha "$SHORT_SHA" \
           --arg commit_msg "$COMMIT_MSG" \
-          --arg repository "${{ inputs.repository }}" \
-          --arg actor "${{ inputs.actor }}" \
+          --arg repository "$REPOSITORY" \
+          --arg actor "$ACTOR" \
           --arg error_msg "$ERROR_MSG" \
-          --arg workflow_url "${{ inputs.workflow_run_url }}" \
-          --arg status "${{ inputs.status }}" \
+          --arg workflow_url "$WORKFLOW_RUN_URL" \
+          --arg status "$STATUS" \
           '
           # Start with header block
           [
@@ -173,7 +186,7 @@ runs:
 
         # Build final payload with channel using jq
         PAYLOAD=$(jq -n \
-          --arg channel "${{ inputs.channel_id }}" \
+          --arg channel "$CHANNEL_ID" \
           --argjson blocks "$BLOCKS" \
           '{
             "channel": $channel,
@@ -188,8 +201,7 @@ runs:
           exit 1
         fi
 
-        # Send to Slack using Web API
-        BOT_TOKEN="${{ inputs.bot_token }}"
+        # Send to Slack using Web API (BOT_TOKEN already set via env:)
         RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
           -H "Authorization: Bearer ${BOT_TOKEN}" \
           -H 'Content-type: application/json' \
