@@ -2,7 +2,11 @@ name: 'Open Remediation PR'
 description: >
   Commits the current working-tree changes as github-actions[bot] onto a new
   branch, pushes it, and opens a draft PR against the given base branch.
-  Assumes the caller already confirmed there are changes to commit.
+  Assumes the caller already confirmed there are changes to commit. Runs
+  `git add -A` with no exclusions — if you stage any scratch/context files
+  outside of what you want committed (e.g. claude-remediation-prepare's
+  context_dir), keep them outside the git worktree (the default, under
+  RUNNER_TEMP) or add them to .git/info/exclude before calling this action.
 inputs:
   branch:
     description: 'Branch name to create and push.'
