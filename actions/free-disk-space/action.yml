@@ -1,0 +1,22 @@
+name: Free Disk Space
+description: Free GitHub-hosted runner disk space before large Docker builds.
+runs:
+  using: composite
+  steps:
+    - name: Free runner disk space
+      shell: bash
+      run: |
+        echo "Disk before cleanup:"
+        df -h /
+        sudo rm -rf \
+          /opt/ghc \
+          /opt/hostedtoolcache \
+          /usr/local/.ghcup \
+          /usr/local/lib/android \
+          /usr/local/share/boost \
+          /usr/share/dotnet \
+          /usr/share/swift
+        sudo docker image prune --all --force || true
+        sudo docker builder prune --all --force || true
+        echo "Disk after cleanup:"
+        df -h /
