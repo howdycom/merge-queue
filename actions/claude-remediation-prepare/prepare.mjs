@@ -20,6 +20,13 @@ const PROTECTED_BRANCHES = new Set(
     .filter(Boolean),
 )
 
+const SENSITIVE_PATH_PREFIXES = (
+  process.env.CLAUDE_REMEDIATION_SENSITIVE_PATH_PREFIXES || '.github/workflows/,.github/actions/'
+)
+  .split(',')
+  .map((prefix) => prefix.trim())
+  .filter(Boolean)
+
 function ghText(args) {
   return execFileSync('gh', args, {
     encoding: 'utf-8',
@@ -80,6 +87,12 @@ function isWritablePermission(permission) {
 
 function isProtectedHeadBranch(branchName) {
   return PROTECTED_BRANCHES.has(branchName)
+}
+
+function touchesSensitivePaths(files) {
+  return files.some((entry) =>
+    SENSITIVE_PATH_PREFIXES.some((prefix) => String(entry?.path || '').startsWith(prefix)),
+  )
 }
 
 function buildRemediationBranch(prNumber, runId, runAttempt) {
@@ -217,6 +230,7 @@ async function prepare() {
       'number',
       'title',
       'url',
+      'files',
     ].join(','),
   ])
 
@@ -231,6 +245,17 @@ async function prepare() {
   if (isProtectedHeadBranch(pr.headRefName)) {
     writeDisabled(
       `Claude remediation will not target protected branch "${pr.headRefName}".`,
+      trigger.prNumber,
+    )
+    return
+  }
+
+  if (touchesSensitivePaths(pr.files || [])) {
+    writeDisabled(
+      'Claude remediation will not run on PRs that modify sensitive paths ' +
+        `(${SENSITIVE_PATH_PREFIXES.join(', ')}). The nested remediation PR's base is this PR's ` +
+        'own head branch, so unreviewed changes there could run with repository secrets before ' +
+        'a human reviews them.',
       trigger.prNumber,
     )
     return

@@ -17,6 +17,13 @@ inputs:
     description: 'Comma-separated list of PR head branches that must never be targeted by a remediation branch.'
     required: false
     default: 'main,master'
+  sensitive_path_prefixes:
+    description: >
+      Comma-separated path prefixes that block remediation if the source PR touches them. The
+      nested remediation PR's base is the source PR's own head branch, so unreviewed changes to
+      workflow/action definitions there could run with repository secrets before human review.
+    required: false
+    default: '.github/workflows/,.github/actions/'
 outputs:
   enabled:
     description: '"true" if remediation should proceed, "false" if the trigger was skipped.'
@@ -61,4 +68,5 @@ runs:
         GH_TOKEN: ${{ inputs.github_token }}
         CLAUDE_REMEDIATION_COMMAND_PREFIX: ${{ inputs.command_prefix }}
         CLAUDE_REMEDIATION_PROTECTED_BRANCHES: ${{ inputs.protected_branches }}
+        CLAUDE_REMEDIATION_SENSITIVE_PATH_PREFIXES: ${{ inputs.sensitive_path_prefixes }}
       run: node "${{ github.action_path }}/prepare.mjs"
