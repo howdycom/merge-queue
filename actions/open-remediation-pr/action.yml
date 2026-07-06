@@ -1,0 +1,77 @@
+name: 'Open Remediation PR'
+description: >
+  Commits the current working-tree changes as github-actions[bot] onto a new
+  branch, pushes it, and opens a draft PR against the given base branch.
+  Assumes the caller already confirmed there are changes to commit.
+inputs:
+  branch:
+    description: 'Branch name to create and push.'
+    required: true
+  base:
+    description: 'Base branch for the PR (typically the source PR head_ref).'
+    required: true
+  title:
+    description: 'PR title.'
+    required: true
+  body:
+    description: 'PR body.'
+    required: false
+    default: ''
+  commit_message:
+    description: 'Commit message for the bot commit.'
+    required: false
+    default: 'fix: automated remediation'
+  github_token:
+    description: 'Token used to push the branch and open the PR. Use a PAT here if you want the resulting PR to trigger other workflows (the default GITHUB_TOKEN does not).'
+    required: true
+  draft:
+    description: 'Open the PR as a draft.'
+    required: false
+    default: 'true'
+outputs:
+  url:
+    description: 'URL of the opened PR.'
+    value: ${{ steps.pr.outputs.url }}
+runs:
+  using: composite
+  steps:
+    - name: Commit and push
+      shell: bash
+      env:
+        BRANCH: ${{ inputs.branch }}
+        COMMIT_MESSAGE: ${{ inputs.commit_message }}
+        GH_TOKEN: ${{ inputs.github_token }}
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git switch -c "$BRANCH"
+        git add -A
+        git commit -m "$COMMIT_MESSAGE"
+        git push --set-upstream \
+          "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+          "$BRANCH"
+
+    - name: Open draft PR
+      id: pr
+      shell: bash
+      env:
+        BASE: ${{ inputs.base }}
+        BODY: ${{ inputs.body }}
+        BRANCH: ${{ inputs.branch }}
+        DRAFT: ${{ inputs.draft }}
+        GH_TOKEN: ${{ inputs.github_token }}
+        TITLE: ${{ inputs.title }}
+      run: |
+        DRAFT_FLAG=()
+        if [ "$DRAFT" = "true" ]; then
+          DRAFT_FLAG=(--draft)
+        fi
+
+        URL=$(gh pr create \
+          "${DRAFT_FLAG[@]}" \
+          --base "$BASE" \
+          --head "$BRANCH" \
+          --title "$TITLE" \
+          --body "$BODY")
+
+        echo "url=$URL" >> "$GITHUB_OUTPUT"

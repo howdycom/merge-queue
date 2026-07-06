@@ -1,0 +1,64 @@
+name: 'Prepare Claude Remediation'
+description: >
+  Validates a slash-command trigger comment on a PR (e.g. "/claude-fix" or
+  "/claude-fix all"), checks the commenter's permission and branch safety,
+  and gathers PR context (metadata, diff, review/issue comments) for an
+  automated Claude remediation run. Runs with plain node — no repo toolchain
+  install required.
+inputs:
+  github_token:
+    description: 'Token with repo read access, used by gh CLI for permission checks, PR metadata, diff, and comments.'
+    required: true
+  command_prefix:
+    description: 'Comment prefix that triggers remediation. "<prefix> all" (as a top-level PR comment) triggers full-PR remediation; the bare prefix as a reply to an inline review comment triggers single-finding remediation.'
+    required: false
+    default: '/claude-fix'
+  protected_branches:
+    description: 'Comma-separated list of PR head branches that must never be targeted by a remediation branch.'
+    required: false
+    default: 'main,master'
+outputs:
+  enabled:
+    description: '"true" if remediation should proceed, "false" if the trigger was skipped.'
+    value: ${{ steps.prepare.outputs.enabled }}
+  skip_reason:
+    description: 'Human-readable reason remediation was skipped (only set when enabled is "false").'
+    value: ${{ steps.prepare.outputs.skip_reason }}
+  command_scope:
+    description: '"single" (one inline finding) or "all" (all eligible findings).'
+    value: ${{ steps.prepare.outputs.command_scope }}
+  context_dir:
+    description: 'Directory containing request.json, pr.json, pr.diff, review-comments.json, issue-comments.json.'
+    value: ${{ steps.prepare.outputs.context_dir }}
+  head_ref:
+    description: 'Head branch name of the source PR.'
+    value: ${{ steps.prepare.outputs.head_ref }}
+  head_sha:
+    description: 'Head commit SHA of the source PR.'
+    value: ${{ steps.prepare.outputs.head_sha }}
+  pr_number:
+    description: 'Source PR number.'
+    value: ${{ steps.prepare.outputs.pr_number }}
+  pr_title:
+    description: 'Source PR title.'
+    value: ${{ steps.prepare.outputs.pr_title }}
+  pr_url:
+    description: 'Source PR URL.'
+    value: ${{ steps.prepare.outputs.pr_url }}
+  remediation_branch:
+    description: 'Suggested branch name for the remediation commit (unique per run).'
+    value: ${{ steps.prepare.outputs.remediation_branch }}
+  trigger_url:
+    description: 'URL of the comment that triggered this run.'
+    value: ${{ steps.prepare.outputs.trigger_url }}
+runs:
+  using: composite
+  steps:
+    - name: Run prepare script
+      id: prepare
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        CLAUDE_REMEDIATION_COMMAND_PREFIX: ${{ inputs.command_prefix }}
+        CLAUDE_REMEDIATION_PROTECTED_BRANCHES: ${{ inputs.protected_branches }}
+      run: node "${{ github.action_path }}/prepare.mjs"
