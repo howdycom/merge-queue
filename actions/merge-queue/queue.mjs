@@ -72,7 +72,17 @@ function logAction(message) {
 function getVar(name) {
   try {
     return ghJson(['api', `repos/${REPO}/actions/variables/${name}`]).value || ''
-  } catch {
+  } catch (err) {
+    const message = String(err.message || err)
+    if (!/404/.test(message)) {
+      // A genuinely-absent variable 404s -- that's the expected "idle" case.
+      // Anything else (auth failure, rate limit, transient 5xx) getting
+      // silently treated the same way as "idle" risks a double-claim if it
+      // happens to coincide with another trigger. Surface it loudly instead
+      // of masking it, even though we still fall back to treating it as
+      // empty since there's no better recovery available here.
+      log(`Warning: unexpected error reading variable ${name}, treating as unset: ${message.split('\n')[0]}`)
+    }
     return ''
   }
 }
@@ -284,7 +294,19 @@ async function checkCompletion() {
   const checks = ghJson(['pr', 'checks', pr, '--required', '--json', 'name,bucket'])
   const failing = checks.filter((c) => c.bucket === 'fail' || c.bucket === 'cancel')
   if (failing.length === 0) {
-    log(`No failing checks on PR #${pr} yet. Leaving it to native auto-merge (or a later check-completion run).`)
+    // Enabling auto-merge at claim time (in dequeue) can silently fail if
+    // GitHub requires branch-protection conditions to already be met at the
+    // moment it's requested -- unconfirmed whether that applies to classic
+    // per-PR auto-merge, but cheap to guard against regardless. Re-verify
+    // and retry here, on every check-completion run, rather than trusting
+    // the single claim-time attempt.
+    const autoMergeState = ghJson(['pr', 'view', pr, '--json', 'autoMergeRequest']).autoMergeRequest
+    if (!autoMergeState) {
+      log(`PR #${pr} has no active auto-merge request. Retrying enableAutoMerge (checks are otherwise green).`)
+      enableAutoMerge(pr)
+    } else {
+      log(`No failing checks on PR #${pr} yet, auto-merge already active. Leaving it to native auto-merge.`)
+    }
     return
   }
 
@@ -308,6 +330,13 @@ async function cleanup() {
   // Not an eviction -- no requires-action label, no comment. Being closed,
   // unlabeled, or freshly pushed to isn't a failure, just no longer
   // applicable to what the queue was watching.
+
+  // The queue is idle again now, but nothing else guarantees a fresh dequeue
+  // gets triggered -- a synchronize/unlabeled/close on the in-flight PR
+  // isn't a push or a labeled event itself. Without this, a still-ready PR
+  // elsewhere in the queue would sit stalled until some unrelated event
+  // happened to fire. Pick up the next one immediately instead.
+  await dequeue()
 }
 
 async function watchdog() {
