@@ -15,6 +15,7 @@ import { execFileSync } from 'node:child_process'
 const REPO = requireEnv('GITHUB_REPOSITORY')
 const COMMAND = requireEnv('MQ_COMMAND')
 const TARGET_BRANCH = process.env.MQ_TARGET_BRANCH || ''
+const MERGE_METHOD = process.env.MQ_MERGE_METHOD || 'squash'
 const READY_LABEL = process.env.MQ_READY_LABEL || 'ready to merge'
 const PROCESSING_LABEL = process.env.MQ_PROCESSING_LABEL || 'merge-queue: processing'
 const REQUIRES_ACTION_LABEL = process.env.MQ_REQUIRES_ACTION_LABEL || 'requires action'
@@ -126,6 +127,22 @@ function comment(prNumber, body) {
   gh(['pr', 'comment', String(prNumber), '--body', body])
 }
 
+function enableAutoMerge(prNumber) {
+  // Enabled here rather than trusted as a precondition: a PR that's
+  // ready-labeled but never actually had auto-merge turned on would sit
+  // fully green and just never merge, jamming the queue until the watchdog
+  // evicts an otherwise-healthy PR.
+  logAction(`enable auto-merge (--${MERGE_METHOD}) on PR #${prNumber}`)
+  if (DRY_RUN) return
+  try {
+    gh(['pr', 'merge', String(prNumber), '--auto', `--${MERGE_METHOD}`])
+  } catch (err) {
+    // Already enabled, or the repo/PR doesn't allow it -- log and continue;
+    // check-completion/watchdog will still catch a PR that never merges.
+    log(`Warning: could not enable auto-merge on PR #${prNumber}: ${String(err.message || err).split('\n')[0]}`)
+  }
+}
+
 function evict(prNumber, reason) {
   log(`Evicting PR #${prNumber}: ${reason}`)
   removeLabel(prNumber, READY_LABEL)
@@ -167,7 +184,18 @@ async function dequeue() {
     return
   }
 
-  const prs = ghJson(['pr', 'list', '--state', 'open', '--label', READY_LABEL, '--json', 'number,title,labels,createdAt'])
+  const prs = ghJson([
+    'pr',
+    'list',
+    '--state',
+    'open',
+    '--base',
+    TARGET_BRANCH,
+    '--label',
+    READY_LABEL,
+    '--json',
+    'number,title,labels,createdAt',
+  ])
   if (prs.length === 0) {
     log('Queue is empty.')
     return
@@ -193,6 +221,7 @@ async function dequeue() {
   setVar('MERGE_QUEUE_SHA', 'pending')
   setVar('MERGE_QUEUE_CLAIMED_AT', new Date().toISOString())
   addLabel(next.number, PROCESSING_LABEL)
+  enableAutoMerge(next.number)
 
   const before = DRY_RUN
     ? 'dry-run-placeholder-sha'
@@ -252,7 +281,7 @@ async function checkCompletion() {
     return
   }
 
-  const checks = ghJson(['pr', 'checks', pr, '--json', 'name,bucket'])
+  const checks = ghJson(['pr', 'checks', pr, '--required', '--json', 'name,bucket'])
   const failing = checks.filter((c) => c.bucket === 'fail' || c.bucket === 'cancel')
   if (failing.length === 0) {
     log(`No failing checks on PR #${pr} yet. Leaving it to native auto-merge (or a later check-completion run).`)

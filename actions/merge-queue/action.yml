@@ -17,6 +17,15 @@ inputs:
   target_branch:
     description: 'Branch PRs are queued to merge into (e.g. develop).'
     required: true
+  merge_method:
+    description: >
+      Passed to `gh pr merge --auto`. The dequeue command enables auto-merge
+      itself rather than trusting the PR author already turned it on -- a PR
+      that's ready-labeled but never had auto-merge enabled would otherwise
+      sit fully green and just never merge, jamming the queue until the
+      watchdog evicts a perfectly healthy PR.
+    required: false
+    default: 'squash'
   ready_label:
     description: 'Human-applied label marking a PR ready to enter the queue.'
     required: false
@@ -64,8 +73,10 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github_token }}
+        GH_REPO: ${{ github.repository }}
         MQ_COMMAND: ${{ inputs.command }}
         MQ_TARGET_BRANCH: ${{ inputs.target_branch }}
+        MQ_MERGE_METHOD: ${{ inputs.merge_method }}
         MQ_READY_LABEL: ${{ inputs.ready_label }}
         MQ_PROCESSING_LABEL: ${{ inputs.processing_label }}
         MQ_REQUIRES_ACTION_LABEL: ${{ inputs.requires_action_label }}

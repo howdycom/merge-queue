@@ -7,6 +7,10 @@ on:
         description: 'Branch PRs are queued to merge into (e.g. develop).'
         required: true
         type: string
+      merge_method:
+        description: 'Passed to `gh pr merge --auto` when the dequeue job enables auto-merge.'
+        type: string
+        default: 'squash'
       ready_label:
         type: string
         default: 'ready to merge'
@@ -62,6 +66,7 @@ jobs:
           command: dequeue
           github_token: ${{ secrets.github_token }}
           target_branch: ${{ inputs.target_branch }}
+          merge_method: ${{ inputs.merge_method }}
           ready_label: ${{ inputs.ready_label }}
           processing_label: ${{ inputs.processing_label }}
           requires_action_label: ${{ inputs.requires_action_label }}
@@ -91,9 +96,13 @@ jobs:
   cleanup:
     if: >
       github.event_name == 'pull_request' &&
-      contains(fromJSON('["unlabeled","closed","synchronize"]'), github.event.action) &&
       vars.MERGE_QUEUE_PR != '' &&
-      format('{0}', github.event.pull_request.number) == vars.MERGE_QUEUE_PR
+      format('{0}', github.event.pull_request.number) == vars.MERGE_QUEUE_PR &&
+      (
+        github.event.action == 'closed' ||
+        github.event.action == 'synchronize' ||
+        (github.event.action == 'unlabeled' && github.event.label.name == inputs.ready_label)
+      )
     runs-on: ${{ inputs.runs_on }}
     steps:
       - name: Clear stale in-flight state
