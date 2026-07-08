@@ -26,6 +26,41 @@ Reference actions and workflows by tag, not by branch:
 | [`actions/slack-notification`](actions/slack-notification) | Posts a status notification (deploy, scheduled job, CI result) to Slack via Block Kit. |
 | [`actions/claude-remediation-prepare`](actions/claude-remediation-prepare) | Validates a `/claude-fix` trigger comment, checks commenter permission and branch/build-tooling safety, and gathers PR context (metadata, diff, comments) for a Claude remediation run. Runs on plain `node`, no repo toolchain needed. |
 | [`actions/open-remediation-pr`](actions/open-remediation-pr) | Commits working-tree changes as `github-actions[bot]`, pushes a new branch, and opens a draft PR against a given base branch. |
+| [`actions/merge-queue`](actions/merge-queue) | One state-machine step (`dequeue` / `check-completion` / `cleanup` / `watchdog`) of the merge-queue simulator — see below. |
+
+## Available reusable workflows
+
+| Workflow | Purpose |
+|---|---|
+| [`.github/workflows/merge-queue.yml`](.github/workflows/merge-queue.yml) | Serializes label-marked ("ready to merge") PRs into a target branch: priority-tiered queue, `update-branch` + native auto-merge for the happy path, event-driven failure detection (no polling except a rare watchdog). Call it from a thin caller workflow with the real triggers — see usage below. |
+
+```yaml
+# consumer-repo/.github/workflows/merge-queue.yml
+on:
+  push:
+    branches: [develop]
+  pull_request:
+    types: [labeled, unlabeled, closed, synchronize]
+  workflow_run:
+    types: [completed]
+  schedule:
+    - cron: '0 */3 * * *'   # watchdog only
+
+jobs:
+  process:
+    uses: howdycom/workflows/.github/workflows/merge-queue.yml@v1
+    with:
+      target_branch: develop
+      tier1_labels: bug
+      tier1_title_regex: '^\[HOTFIX\]'
+      tier2_title_regex: '^\[HCP-'
+    secrets:
+      github_token: ${{ secrets.MERGE_QUEUE_GITHUB_TOKEN }}
+```
+
+### Security notes for merge-queue consumers
+
+`GITHUB_TOKEN` cannot write repository Actions variables (no grantable permission scope covers it) — this design tracks in-flight state that way specifically so the `workflow_run` completion listener can be gated by a job-level `if:`, which is what makes it free to run on every completed workflow in the repo (skipped jobs never reach a runner). That means every consumer needs its own fine-grained PAT (e.g. `MERGE_QUEUE_GITHUB_TOKEN`), scoped to exactly: **Contents** (write — required by the `update-branch` endpoint), **Pull requests** (write — labels, comments, update-branch), **Variables** (read/write). Don't broaden it further, and don't reuse a PAT provisioned for a different purpose (e.g. `CLAUDE_REMEDIATION_GITHUB_TOKEN`).
 
 ## Security notes for claude-remediation consumers
 

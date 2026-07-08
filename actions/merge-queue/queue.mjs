@@ -1,0 +1,313 @@
+#!/usr/bin/env node
+// Zero-dependency Node script implementing the merge-queue state machine.
+// Commands: dequeue | check-completion | cleanup | watchdog (see action.yml).
+//
+// State lives in three repo Actions variables (requires a PAT -- GITHUB_TOKEN
+// cannot write repo variables, see the design proposal's cost-model section
+// for why a file-based alternative was rejected):
+//   MERGE_QUEUE_PR         - PR number currently in flight, or unset if idle
+//   MERGE_QUEUE_SHA        - head SHA we're watching checks for ("pending"
+//                            between claiming a PR and update-branch settling)
+//   MERGE_QUEUE_CLAIMED_AT - ISO8601 timestamp of when the PR was claimed,
+//                            used only by the watchdog command
+import { execFileSync } from 'node:child_process'
+
+const REPO = requireEnv('GITHUB_REPOSITORY')
+const COMMAND = requireEnv('MQ_COMMAND')
+const TARGET_BRANCH = process.env.MQ_TARGET_BRANCH || ''
+const READY_LABEL = process.env.MQ_READY_LABEL || 'ready to merge'
+const PROCESSING_LABEL = process.env.MQ_PROCESSING_LABEL || 'merge-queue: processing'
+const REQUIRES_ACTION_LABEL = process.env.MQ_REQUIRES_ACTION_LABEL || 'requires action'
+const TIER1_LABELS = (process.env.MQ_TIER1_LABELS || 'bug')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)
+const TIER1_TITLE_REGEX = new RegExp(process.env.MQ_TIER1_TITLE_REGEX || '^\\[HOTFIX\\]', 'i')
+const TIER2_TITLE_REGEX = new RegExp(process.env.MQ_TIER2_TITLE_REGEX || '^\\[HCP-', 'i')
+const STALE_AFTER_MINUTES = Number(process.env.MQ_STALE_AFTER_MINUTES || '90')
+const EVENT_PR_NUMBER = process.env.MQ_EVENT_PR_NUMBER || ''
+const EVENT_ACTION = process.env.MQ_EVENT_ACTION || ''
+const DRY_RUN = process.env.MQ_DRY_RUN === 'true'
+const UPDATE_BRANCH_POLL_ATTEMPTS = 12
+const UPDATE_BRANCH_POLL_INTERVAL_MS = 5000
+
+function requireEnv(name) {
+  const value = process.env[name]
+  if (!value) throw new Error(`Missing required environment variable: ${name}`)
+  return value
+}
+
+function sh(args) {
+  return execFileSync(args[0], args.slice(1), { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+}
+
+function gh(args) {
+  return sh(['gh', ...args])
+}
+
+function ghJson(args) {
+  return JSON.parse(gh(args))
+}
+
+function ghPaginatedJson(endpoint) {
+  const pages = ghJson(['api', '--paginate', '--slurp', endpoint])
+  return pages.flat()
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function log(message) {
+  console.log(`[merge-queue:${COMMAND}] ${message}`)
+}
+
+function logAction(message) {
+  log(DRY_RUN ? `[dry-run] would ${message}` : message)
+}
+
+// ---- state variables (require the PAT passed as GH_TOKEN) ----
+
+function getVar(name) {
+  try {
+    return ghJson(['api', `repos/${REPO}/actions/variables/${name}`]).value || ''
+  } catch {
+    return ''
+  }
+}
+
+function setVar(name, value) {
+  logAction(`set ${name}=${value}`)
+  if (DRY_RUN) return
+  try {
+    gh(['api', '-X', 'PATCH', `repos/${REPO}/actions/variables/${name}`, '-f', `value=${value}`])
+  } catch {
+    gh(['api', '-X', 'POST', `repos/${REPO}/actions/variables`, '-f', `name=${name}`, '-f', `value=${value}`])
+  }
+}
+
+function deleteVar(name) {
+  logAction(`delete variable ${name}`)
+  if (DRY_RUN) return
+  try {
+    gh(['api', '-X', 'DELETE', `repos/${REPO}/actions/variables/${name}`])
+  } catch {
+    // already absent -- fine
+  }
+}
+
+function clearQueueState() {
+  deleteVar('MERGE_QUEUE_PR')
+  deleteVar('MERGE_QUEUE_SHA')
+  deleteVar('MERGE_QUEUE_CLAIMED_AT')
+}
+
+// ---- PR mutations ----
+
+function addLabel(prNumber, label) {
+  logAction(`add label "${label}" to PR #${prNumber}`)
+  if (DRY_RUN) return
+  gh(['pr', 'edit', String(prNumber), '--add-label', label])
+}
+
+function removeLabel(prNumber, label) {
+  logAction(`remove label "${label}" from PR #${prNumber}`)
+  if (DRY_RUN) return
+  try {
+    gh(['pr', 'edit', String(prNumber), '--remove-label', label])
+  } catch {
+    // label may already be absent (e.g. a human just removed it themselves) -- fine
+  }
+}
+
+function comment(prNumber, body) {
+  logAction(`comment on PR #${prNumber}: ${body.split('\n')[0]}`)
+  if (DRY_RUN) return
+  gh(['pr', 'comment', String(prNumber), '--body', body])
+}
+
+function evict(prNumber, reason) {
+  log(`Evicting PR #${prNumber}: ${reason}`)
+  removeLabel(prNumber, READY_LABEL)
+  removeLabel(prNumber, PROCESSING_LABEL)
+  addLabel(prNumber, REQUIRES_ACTION_LABEL)
+  comment(
+    prNumber,
+    `Removed from the merge queue: ${reason}\n\nFix the issue and re-add \`${READY_LABEL}\` to re-enter the queue.`,
+  )
+  if (getVar('MERGE_QUEUE_PR') === String(prNumber)) {
+    clearQueueState()
+  }
+}
+
+// ---- priority classification ----
+
+function classifyTier(pr) {
+  const labelNames = (pr.labels || []).map((l) => l.name)
+  if (TIER1_LABELS.some((l) => labelNames.includes(l)) || TIER1_TITLE_REGEX.test(pr.title)) return 1
+  if (TIER2_TITLE_REGEX.test(pr.title)) return 2
+  return 3
+}
+
+function getReadySince(prNumber, fallback) {
+  const events = ghPaginatedJson(`repos/${REPO}/issues/${prNumber}/timeline?per_page=100`)
+  const labelEvents = events.filter(
+    (e) => e.event === 'labeled' && e.label && e.label.name === READY_LABEL,
+  )
+  if (labelEvents.length === 0) return fallback
+  return labelEvents[labelEvents.length - 1].created_at
+}
+
+// ---- commands ----
+
+async function dequeue() {
+  const inFlight = getVar('MERGE_QUEUE_PR')
+  if (inFlight) {
+    log(`Already in flight: PR #${inFlight}. Nothing to do.`)
+    return
+  }
+
+  const prs = ghJson(['pr', 'list', '--state', 'open', '--label', READY_LABEL, '--json', 'number,title,labels,createdAt'])
+  if (prs.length === 0) {
+    log('Queue is empty.')
+    return
+  }
+
+  const withMeta = prs.map((pr) => ({
+    ...pr,
+    tier: classifyTier(pr),
+    readySince: getReadySince(pr.number, pr.createdAt),
+  }))
+
+  withMeta.sort((a, b) => {
+    if (a.tier !== b.tier) return a.tier - b.tier
+    return new Date(a.readySince) - new Date(b.readySince)
+  })
+
+  const next = withMeta[0]
+  log(`Dequeuing PR #${next.number} "${next.title}" (tier ${next.tier}, ready since ${next.readySince})`)
+
+  // Claim BEFORE calling update-branch so a crash mid-call is visible as
+  // "stuck in flight" (catchable by the watchdog) rather than invisible.
+  setVar('MERGE_QUEUE_PR', String(next.number))
+  setVar('MERGE_QUEUE_SHA', 'pending')
+  setVar('MERGE_QUEUE_CLAIMED_AT', new Date().toISOString())
+  addLabel(next.number, PROCESSING_LABEL)
+
+  const before = DRY_RUN
+    ? 'dry-run-placeholder-sha'
+    : ghJson(['pr', 'view', String(next.number), '--json', 'headRefOid']).headRefOid
+
+  logAction(`call PUT /pulls/${next.number}/update-branch`)
+  if (DRY_RUN) {
+    setVar('MERGE_QUEUE_SHA', before)
+    return
+  }
+
+  try {
+    gh(['api', '-X', 'PUT', `repos/${REPO}/pulls/${next.number}/update-branch`])
+  } catch (err) {
+    const message = String(err.message || err)
+    if (/up.to.date|not.*behind/i.test(message)) {
+      // Already current with the target branch -- not a failure, proceed
+      // to watch the existing head SHA.
+      log(`PR #${next.number} is already up to date with ${TARGET_BRANCH}.`)
+      setVar('MERGE_QUEUE_SHA', before)
+      return
+    }
+    evict(
+      next.number,
+      `Could not update with \`${TARGET_BRANCH}\`, most likely a merge conflict. Resolve the conflict manually, then re-add \`${READY_LABEL}\`.`,
+    )
+    return
+  }
+
+  // update-branch is asynchronous (202 accepted) -- poll briefly for the
+  // head SHA to actually change before trusting it as the SHA to watch.
+  let newSha = before
+  for (let attempt = 0; attempt < UPDATE_BRANCH_POLL_ATTEMPTS; attempt++) {
+    await sleep(UPDATE_BRANCH_POLL_INTERVAL_MS)
+    const current = ghJson(['pr', 'view', String(next.number), '--json', 'headRefOid']).headRefOid
+    if (current !== before) {
+      newSha = current
+      break
+    }
+  }
+
+  if (newSha === before) {
+    log(
+      `Warning: head SHA for PR #${next.number} had not changed after ${(UPDATE_BRANCH_POLL_ATTEMPTS * UPDATE_BRANCH_POLL_INTERVAL_MS) / 1000}s. Leaving it tracked at the current SHA; the watchdog will evict it if it never settles.`,
+    )
+  }
+
+  setVar('MERGE_QUEUE_SHA', newSha)
+  log(`Now watching PR #${next.number} at ${newSha}.`)
+}
+
+async function checkCompletion() {
+  const pr = getVar('MERGE_QUEUE_PR')
+  const sha = getVar('MERGE_QUEUE_SHA')
+  if (!pr || !sha || sha === 'pending') {
+    log('Nothing resolvable in flight. Nothing to do.')
+    return
+  }
+
+  const checks = ghJson(['pr', 'checks', pr, '--json', 'name,bucket'])
+  const failing = checks.filter((c) => c.bucket === 'fail' || c.bucket === 'cancel')
+  if (failing.length === 0) {
+    log(`No failing checks on PR #${pr} yet. Leaving it to native auto-merge (or a later check-completion run).`)
+    return
+  }
+
+  const names = failing.map((c) => c.name).join(', ')
+  evict(
+    pr,
+    `Required check(s) failed after updating with \`${TARGET_BRANCH}\`: ${names}. This may mean the change needs adjusting for the latest \`${TARGET_BRANCH}\`, or it's an unrelated flake -- check the failing job(s) before re-adding the label.`,
+  )
+}
+
+async function cleanup() {
+  const pr = getVar('MERGE_QUEUE_PR')
+  if (!pr || pr !== EVENT_PR_NUMBER) {
+    log(`PR #${EVENT_PR_NUMBER} is not the tracked in-flight PR (tracked: ${pr || 'none'}). Nothing to do.`)
+    return
+  }
+
+  log(`Clearing in-flight state for PR #${EVENT_PR_NUMBER} (event: ${EVENT_ACTION}).`)
+  removeLabel(EVENT_PR_NUMBER, PROCESSING_LABEL)
+  clearQueueState()
+  // Not an eviction -- no requires-action label, no comment. Being closed,
+  // unlabeled, or freshly pushed to isn't a failure, just no longer
+  // applicable to what the queue was watching.
+}
+
+async function watchdog() {
+  const pr = getVar('MERGE_QUEUE_PR')
+  const claimedAt = getVar('MERGE_QUEUE_CLAIMED_AT')
+  if (!pr || !claimedAt) {
+    log('Queue is idle. Nothing to do.')
+    return
+  }
+
+  const elapsedMinutes = (Date.now() - new Date(claimedAt).getTime()) / 60000
+  if (elapsedMinutes <= STALE_AFTER_MINUTES) {
+    log(`PR #${pr} has been in flight for ${Math.round(elapsedMinutes)}m, under the ${STALE_AFTER_MINUTES}m threshold.`)
+    return
+  }
+
+  evict(
+    pr,
+    `Stuck in the merge queue for over ${STALE_AFTER_MINUTES} minutes with no resolution -- treating it as hung. If checks are just unusually slow, confirm the PR is actually healthy before re-adding \`${READY_LABEL}\`.`,
+  )
+}
+
+const commands = { dequeue, 'check-completion': checkCompletion, cleanup, watchdog }
+const run = commands[COMMAND]
+if (!run) {
+  throw new Error(`Unknown command: ${COMMAND}`)
+}
+
+run().catch((err) => {
+  console.error(err)
+  process.exit(1)
+})
