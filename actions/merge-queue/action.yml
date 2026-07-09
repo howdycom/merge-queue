@@ -1,0 +1,90 @@
+name: 'Merge Queue'
+description: >
+  Runs one step of a merge-queue state machine: dequeue the next ready PR and
+  update it against the target branch, check the in-flight PR's completion
+  status, clean up after it's closed/unlabeled/pushed-to, or evict it if it's
+  been stuck too long. See the design proposal for the full state machine.
+inputs:
+  command:
+    description: 'One of: dequeue | check-completion | cleanup | watchdog'
+    required: true
+  github_token:
+    description: >
+      PAT (not GITHUB_TOKEN -- it cannot write repo Actions variables) scoped
+      to this repo with: Contents (write, required by update-branch),
+      Pull requests (write), Variables (read/write).
+    required: true
+  target_branch:
+    description: 'Branch PRs are queued to merge into (e.g. develop).'
+    required: true
+  merge_method:
+    description: >
+      Passed to `gh pr merge --auto`. The dequeue command enables auto-merge
+      itself rather than trusting the PR author already turned it on -- a PR
+      that's ready-labeled but never had auto-merge enabled would otherwise
+      sit fully green and just never merge, jamming the queue until the
+      watchdog evicts a perfectly healthy PR.
+    required: false
+    default: 'squash'
+  ready_label:
+    description: 'Human-applied label marking a PR ready to enter the queue.'
+    required: false
+    default: 'ready to merge'
+  processing_label:
+    description: 'System-owned label marking the one PR currently in flight.'
+    required: false
+    default: 'merge-queue: processing'
+  requires_action_label:
+    description: 'System-owned label applied on eviction.'
+    required: false
+    default: 'requires action'
+  tier1_labels:
+    description: 'Comma-separated labels that put a PR in priority tier 1.'
+    required: false
+    default: 'bug'
+  tier1_title_regex:
+    description: 'Title regex (case-insensitive) that puts a PR in priority tier 1.'
+    required: false
+    default: '^\[HOTFIX\]'
+  tier2_title_regex:
+    description: 'Title regex (case-insensitive) that puts a PR in priority tier 2.'
+    required: false
+    default: '^\[HCP-'
+  stale_after_minutes:
+    description: 'For the watchdog command: evict the in-flight PR if it has been claimed longer than this with no resolution.'
+    required: false
+    default: '90'
+  event_pr_number:
+    description: 'For the cleanup command: github.event.pull_request.number from the triggering event.'
+    required: false
+    default: ''
+  event_action:
+    description: 'For the cleanup command: github.event.action from the triggering event, used in log messages.'
+    required: false
+    default: ''
+  dry_run:
+    description: 'Log intended mutations instead of making them. For shadow-mode rollout.'
+    required: false
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: Run merge-queue command
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        GH_REPO: ${{ github.repository }}
+        MQ_COMMAND: ${{ inputs.command }}
+        MQ_TARGET_BRANCH: ${{ inputs.target_branch }}
+        MQ_MERGE_METHOD: ${{ inputs.merge_method }}
+        MQ_READY_LABEL: ${{ inputs.ready_label }}
+        MQ_PROCESSING_LABEL: ${{ inputs.processing_label }}
+        MQ_REQUIRES_ACTION_LABEL: ${{ inputs.requires_action_label }}
+        MQ_TIER1_LABELS: ${{ inputs.tier1_labels }}
+        MQ_TIER1_TITLE_REGEX: ${{ inputs.tier1_title_regex }}
+        MQ_TIER2_TITLE_REGEX: ${{ inputs.tier2_title_regex }}
+        MQ_STALE_AFTER_MINUTES: ${{ inputs.stale_after_minutes }}
+        MQ_EVENT_PR_NUMBER: ${{ inputs.event_pr_number }}
+        MQ_EVENT_ACTION: ${{ inputs.event_action }}
+        MQ_DRY_RUN: ${{ inputs.dry_run }}
+      run: node "${{ github.action_path }}/queue.mjs"

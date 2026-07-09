@@ -1,0 +1,133 @@
+name: Merge Queue (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      target_branch:
+        description: 'Branch PRs are queued to merge into (e.g. develop).'
+        required: true
+        type: string
+      merge_method:
+        description: 'Passed to `gh pr merge --auto` when the dequeue job enables auto-merge.'
+        type: string
+        default: 'squash'
+      ready_label:
+        type: string
+        default: 'ready to merge'
+      processing_label:
+        type: string
+        default: 'merge-queue: processing'
+      requires_action_label:
+        type: string
+        default: 'requires action'
+      tier1_labels:
+        description: 'Comma-separated labels that put a PR in priority tier 1.'
+        type: string
+        default: 'bug'
+      tier1_title_regex:
+        type: string
+        default: '^\[HOTFIX\]'
+      tier2_title_regex:
+        type: string
+        default: '^\[HCP-'
+      stale_after_minutes:
+        description: 'Watchdog: evict the in-flight PR if claimed longer than this with no resolution.'
+        type: number
+        default: 90
+      dry_run:
+        description: 'Log intended mutations instead of making them. For shadow-mode rollout.'
+        type: boolean
+        default: false
+      runs_on:
+        type: string
+        default: 'ubuntu-slim'
+    secrets:
+      github_token:
+        description: >
+          PAT scoped to this repo with Contents (write), Pull requests
+          (write), and Variables (read/write) -- GITHUB_TOKEN cannot write
+          repo Actions variables, which this design depends on.
+        required: true
+
+concurrency:
+  group: merge-queue-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  dequeue:
+    if: >
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name == inputs.ready_label)
+    runs-on: ${{ inputs.runs_on }}
+    steps:
+      - name: Dequeue next PR
+        uses: howdycom/workflows/actions/merge-queue@v1
+        with:
+          command: dequeue
+          github_token: ${{ secrets.github_token }}
+          target_branch: ${{ inputs.target_branch }}
+          merge_method: ${{ inputs.merge_method }}
+          ready_label: ${{ inputs.ready_label }}
+          processing_label: ${{ inputs.processing_label }}
+          requires_action_label: ${{ inputs.requires_action_label }}
+          tier1_labels: ${{ inputs.tier1_labels }}
+          tier1_title_regex: ${{ inputs.tier1_title_regex }}
+          tier2_title_regex: ${{ inputs.tier2_title_regex }}
+          dry_run: ${{ inputs.dry_run }}
+
+  check-completion:
+    if: >
+      github.event_name == 'workflow_run' &&
+      vars.MERGE_QUEUE_SHA != '' &&
+      github.event.workflow_run.head_sha == vars.MERGE_QUEUE_SHA
+    runs-on: ${{ inputs.runs_on }}
+    steps:
+      - name: Check in-flight PR's required checks
+        uses: howdycom/workflows/actions/merge-queue@v1
+        with:
+          command: check-completion
+          github_token: ${{ secrets.github_token }}
+          target_branch: ${{ inputs.target_branch }}
+          ready_label: ${{ inputs.ready_label }}
+          processing_label: ${{ inputs.processing_label }}
+          requires_action_label: ${{ inputs.requires_action_label }}
+          dry_run: ${{ inputs.dry_run }}
+
+  cleanup:
+    if: >
+      github.event_name == 'pull_request' &&
+      vars.MERGE_QUEUE_PR != '' &&
+      format('{0}', github.event.pull_request.number) == vars.MERGE_QUEUE_PR &&
+      (
+        github.event.action == 'closed' ||
+        github.event.action == 'synchronize' ||
+        (github.event.action == 'unlabeled' && github.event.label.name == inputs.ready_label)
+      )
+    runs-on: ${{ inputs.runs_on }}
+    steps:
+      - name: Clear stale in-flight state
+        uses: howdycom/workflows/actions/merge-queue@v1
+        with:
+          command: cleanup
+          github_token: ${{ secrets.github_token }}
+          target_branch: ${{ inputs.target_branch }}
+          processing_label: ${{ inputs.processing_label }}
+          event_pr_number: ${{ github.event.pull_request.number }}
+          event_action: ${{ github.event.action }}
+          dry_run: ${{ inputs.dry_run }}
+
+  watchdog:
+    if: github.event_name == 'schedule'
+    runs-on: ${{ inputs.runs_on }}
+    steps:
+      - name: Evict a hung in-flight PR
+        uses: howdycom/workflows/actions/merge-queue@v1
+        with:
+          command: watchdog
+          github_token: ${{ secrets.github_token }}
+          target_branch: ${{ inputs.target_branch }}
+          ready_label: ${{ inputs.ready_label }}
+          processing_label: ${{ inputs.processing_label }}
+          requires_action_label: ${{ inputs.requires_action_label }}
+          stale_after_minutes: ${{ inputs.stale_after_minutes }}
+          dry_run: ${{ inputs.dry_run }}
