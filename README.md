@@ -58,6 +58,45 @@ jobs:
       github_token: ${{ secrets.MERGE_QUEUE_GITHUB_TOKEN }}
 ```
 
+### How the merge queue works
+
+A PR gets the `ready to merge` label once it's approved and green. From there it's automatic — no one manually decides "who merges next":
+
+- **Priority order** — not strict FIFO. Configurable via `tier1_labels`/`tier1_title_regex`/`tier2_title_regex`, defaulting to: PRs labeled `bug` or titled `[HOTFIX]...` go first, then PRs titled `[HCP-...]`, then everything else. Within a tier, whoever's been ready longest goes first (read from when `ready to merge` was actually applied, not PR number or creation date).
+- **The happy path is free** — on a push to `target_branch`, the next PR in line gets `update-branch`'d against the latest target and has auto-merge enabled (the workflow does this itself now — see `queue.mjs`'s `enableAutoMerge`, don't rely on the PR author having turned it on already). GitHub's own auto-merge finishes the job once checks re-pass. No polling, no extra Action runs for the common case.
+- **Eviction** (removes `ready to merge`, adds `requires action`, comments why) happens on: a merge conflict from `update-branch` (immediate, no checks to wait for), a **required** check failing after the update (optional/advisory check failures don't evict), or the watchdog timing out a PR that's been in flight past `stale_after_minutes` with no resolution. A PR closed, unlabeled, or freshly pushed to while in flight is cleaned up the same way state-wise, but isn't treated as a failure — no `requires action`, no comment.
+- **No stuck queue** — clearing the in-flight PR for any reason (eviction or clean cleanup) immediately tries the next one, rather than waiting for an unrelated event to happen to notice. The only timer in the whole system is the watchdog, purely as a last resort for CI that never completes at all.
+
+**Trigger → job mapping.** The reusable workflow has 4 jobs, each with its own `if:` deciding whether it runs at all — this is the exact gating, not a paraphrase:
+
+| Event | Job | Gate |
+|---|---|---|
+| `push` to `target_branch` | `dequeue` | Always tries — the branch filter belongs on the caller's trigger, not this condition |
+| `pull_request` `labeled` | `dequeue` | Only if the label added is `ready_label` — any other label does nothing |
+| `pull_request` `closed` / `synchronize` | `cleanup` | Only if the PR number matches `MERGE_QUEUE_PR` — an unrelated PR does nothing |
+| `pull_request` `unlabeled` | `cleanup` | Same PR-number match, **and** the label removed must specifically be `ready_label` — removing an unrelated label from the in-flight PR does nothing |
+| `workflow_run` `completed` | `check-completion` | Only if `workflow_run.head_sha == MERGE_QUEUE_SHA` — every other firing (any other PR, any other SHA) is skipped before a runner is allocated, which is what keeps this free regardless of how often it fires |
+| `schedule` | `watchdog` | Always evaluates; only acts if the in-flight PR has been claimed longer than `stale_after_minutes` |
+
+**Label lifecycle:**
+
+| Label | Added by | Removed by |
+|---|---|---|
+| `ready_label` (default `ready to merge`) | A human — the only manual step in the whole system | `evict()` on any failure path |
+| `processing_label` (default `merge-queue: processing`) | `dequeue`, immediately after picking a PR — before `update-branch` is even called | `evict()`, or `cleanup` (closed/unlabeled/synchronize) |
+| `requires_action_label` (default `requires action`) | `evict()` only | Never automatically — a human clears it once the underlying problem is fixed |
+
+**State**, for reference: `MERGE_QUEUE_PR` and `MERGE_QUEUE_CLAIMED_AT` are set the instant a PR is claimed; `MERGE_QUEUE_SHA` starts as the literal string `"pending"` and is updated to the real post-`update-branch` SHA once it's confirmed (`dequeue` polls for the head SHA to change, up to 12 times / 5s apart) — that's the exact value `check-completion`'s trigger condition compares against. All three are deleted together by whichever of `evict()`/`cleanup()` runs.
+
+### Prerequisites for a new consumer repo
+
+Check/set these up before wiring in the caller workflow above:
+
+1. **Two new labels must exist** in the consumer repo: `merge-queue: processing` and `requires action` (or whatever you pass via `processing_label`/`requires_action_label` — defaults shown). System-owned; humans shouldn't need to touch them. The "ready" label (default `ready to merge`) is expected to already exist as part of your existing PR workflow.
+2. **`allow_auto_merge` must be enabled** at the repo level (Settings → General → Pull Requests).
+3. **`target_branch` needs required status checks configured** in its branch protection — that's what auto-merge is actually waiting on. Check via `gh api repos/{owner}/{repo}/branches/{branch}/protection`.
+4. **A fine-grained PAT** scoped per the security note below, added as a repo secret and passed as `secrets.github_token`.
+
 ### Security notes for merge-queue consumers
 
 `GITHUB_TOKEN` cannot write repository Actions variables (no grantable permission scope covers it) — this design tracks in-flight state that way specifically so the `workflow_run` completion listener can be gated by a job-level `if:`, which is what makes it free to run on every completed workflow in the repo (skipped jobs never reach a runner). That means every consumer needs its own fine-grained PAT (e.g. `MERGE_QUEUE_GITHUB_TOKEN`), scoped to exactly: **Contents** (write — required by the `update-branch` endpoint), **Pull requests** (write — labels, comments, update-branch), **Variables** (read/write). Don't broaden it further, and don't reuse a PAT provisioned for a different purpose (e.g. `CLAUDE_REMEDIATION_GITHUB_TOKEN`).
