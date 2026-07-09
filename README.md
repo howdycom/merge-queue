@@ -67,6 +67,27 @@ A PR gets the `ready to merge` label once it's approved and green. From there it
 - **Eviction** (removes `ready to merge`, adds `requires action`, comments why) happens on: a merge conflict from `update-branch` (immediate, no checks to wait for), a **required** check failing after the update (optional/advisory check failures don't evict), or the watchdog timing out a PR that's been in flight past `stale_after_minutes` with no resolution. A PR closed, unlabeled, or freshly pushed to while in flight is cleaned up the same way state-wise, but isn't treated as a failure — no `requires action`, no comment.
 - **No stuck queue** — clearing the in-flight PR for any reason (eviction or clean cleanup) immediately tries the next one, rather than waiting for an unrelated event to happen to notice. The only timer in the whole system is the watchdog, purely as a last resort for CI that never completes at all.
 
+**Trigger → job mapping.** The reusable workflow has 4 jobs, each with its own `if:` deciding whether it runs at all — this is the exact gating, not a paraphrase:
+
+| Event | Job | Gate |
+|---|---|---|
+| `push` to `target_branch` | `dequeue` | Always tries — the branch filter belongs on the caller's trigger, not this condition |
+| `pull_request` `labeled` | `dequeue` | Only if the label added is `ready_label` — any other label does nothing |
+| `pull_request` `closed` / `synchronize` | `cleanup` | Only if the PR number matches `MERGE_QUEUE_PR` — an unrelated PR does nothing |
+| `pull_request` `unlabeled` | `cleanup` | Same PR-number match, **and** the label removed must specifically be `ready_label` — removing an unrelated label from the in-flight PR does nothing |
+| `workflow_run` `completed` | `check-completion` | Only if `workflow_run.head_sha == MERGE_QUEUE_SHA` — every other firing (any other PR, any other SHA) is skipped before a runner is allocated, which is what keeps this free regardless of how often it fires |
+| `schedule` | `watchdog` | Always evaluates; only acts if the in-flight PR has been claimed longer than `stale_after_minutes` |
+
+**Label lifecycle:**
+
+| Label | Added by | Removed by |
+|---|---|---|
+| `ready_label` (default `ready to merge`) | A human — the only manual step in the whole system | `evict()` on any failure path |
+| `processing_label` (default `merge-queue: processing`) | `dequeue`, immediately after picking a PR — before `update-branch` is even called | `evict()`, or `cleanup` (closed/unlabeled/synchronize) |
+| `requires_action_label` (default `requires action`) | `evict()` only | Never automatically — a human clears it once the underlying problem is fixed |
+
+**State**, for reference: `MERGE_QUEUE_PR` and `MERGE_QUEUE_CLAIMED_AT` are set the instant a PR is claimed; `MERGE_QUEUE_SHA` starts as the literal string `"pending"` and is updated to the real post-`update-branch` SHA once it's confirmed (`dequeue` polls for the head SHA to change, up to 12 times / 5s apart) — that's the exact value `check-completion`'s trigger condition compares against. All three are deleted together by whichever of `evict()`/`cleanup()` runs.
+
 ### Prerequisites for a new consumer repo
 
 Check/set these up before wiring in the caller workflow above:
