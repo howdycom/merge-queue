@@ -153,7 +153,7 @@ function enableAutoMerge(prNumber) {
   }
 }
 
-function evict(prNumber, reason) {
+async function evict(prNumber, reason) {
   log(`Evicting PR #${prNumber}: ${reason}`)
   removeLabel(prNumber, READY_LABEL)
   removeLabel(prNumber, PROCESSING_LABEL)
@@ -164,6 +164,12 @@ function evict(prNumber, reason) {
   )
   if (getVar('MERGE_QUEUE_PR') === String(prNumber)) {
     clearQueueState()
+    // Same reasoning as cleanup(): the queue is idle again, but nothing else
+    // guarantees a fresh dequeue gets triggered by an eviction specifically
+    // (a conflict, a failed check, or a watchdog timeout isn't a push or a
+    // labeled event itself). Without this, any other ready PR would sit
+    // stalled until an unrelated event happened to fire.
+    await dequeue()
   }
 }
 
@@ -254,7 +260,7 @@ async function dequeue() {
       setVar('MERGE_QUEUE_SHA', before)
       return
     }
-    evict(
+    await evict(
       next.number,
       `Could not update with \`${TARGET_BRANCH}\`, most likely a merge conflict. Resolve the conflict manually, then re-add \`${READY_LABEL}\`.`,
     )
@@ -311,7 +317,7 @@ async function checkCompletion() {
   }
 
   const names = failing.map((c) => c.name).join(', ')
-  evict(
+  await evict(
     pr,
     `Required check(s) failed after updating with \`${TARGET_BRANCH}\`: ${names}. This may mean the change needs adjusting for the latest \`${TARGET_BRANCH}\`, or it's an unrelated flake -- check the failing job(s) before re-adding the label.`,
   )
@@ -353,7 +359,7 @@ async function watchdog() {
     return
   }
 
-  evict(
+  await evict(
     pr,
     `Stuck in the merge queue for over ${STALE_AFTER_MINUTES} minutes with no resolution -- treating it as hung. If checks are just unusually slow, confirm the PR is actually healthy before re-adding \`${READY_LABEL}\`.`,
   )
