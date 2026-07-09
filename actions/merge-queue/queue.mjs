@@ -31,6 +31,13 @@ const EVENT_ACTION = process.env.MQ_EVENT_ACTION || ''
 const DRY_RUN = process.env.MQ_DRY_RUN === 'true'
 const UPDATE_BRANCH_POLL_ATTEMPTS = 12
 const UPDATE_BRANCH_POLL_INTERVAL_MS = 5000
+// Backstop for the dequeue<->evict recursion below. Bounded in the normal
+// case by how many PRs are actually ready (each eviction removes one from
+// candidacy), but that assumption depends on removeLabel(READY_LABEL)
+// actually succeeding -- if it silently fails for a real reason, the same
+// PR could get reselected and re-evicted in a tight loop. This is a hard
+// ceiling independent of that, not a realistic queue-depth estimate.
+const MAX_DEQUEUE_RECURSION_DEPTH = 20
 
 function requireEnv(name) {
   const value = process.env[name]
@@ -126,8 +133,21 @@ function removeLabel(prNumber, label) {
   if (DRY_RUN) return
   try {
     gh(['pr', 'edit', String(prNumber), '--remove-label', label])
-  } catch {
-    // label may already be absent (e.g. a human just removed it themselves) -- fine
+  } catch (err) {
+    // Mirrors getVar's 404-vs-other distinction. NOT independently verified
+    // against a real "label already absent" case (couldn't safely force
+    // this against a live PR to check the exact error text) -- best-effort
+    // by analogy with the underlying REST endpoint's documented 404
+    // behavior, not confirmed the way getVar's 404 handling was. The
+    // recursion-depth guard in evict()/dequeue() below is the real backstop
+    // regardless of whether this pattern-match is exactly right: if
+    // removing READY_LABEL silently fails for a real reason, the same PR
+    // could get reselected and re-evicted in a tight loop with nothing
+    // bounding it otherwise.
+    const message = String(err.message || err)
+    if (!/404/.test(message)) {
+      log(`Warning: could not remove label "${label}" from PR #${prNumber}, treating as already absent: ${message.split('\n')[0]}`)
+    }
   }
 }
 
@@ -153,7 +173,7 @@ function enableAutoMerge(prNumber) {
   }
 }
 
-async function evict(prNumber, reason) {
+async function evict(prNumber, reason, depth = 0) {
   log(`Evicting PR #${prNumber}: ${reason}`)
   removeLabel(prNumber, READY_LABEL)
   removeLabel(prNumber, PROCESSING_LABEL)
@@ -169,7 +189,7 @@ async function evict(prNumber, reason) {
     // (a conflict, a failed check, or a watchdog timeout isn't a push or a
     // labeled event itself). Without this, any other ready PR would sit
     // stalled until an unrelated event happened to fire.
-    await dequeue()
+    await dequeue(depth + 1)
   }
 }
 
@@ -193,7 +213,14 @@ function getReadySince(prNumber, fallback) {
 
 // ---- commands ----
 
-async function dequeue() {
+async function dequeue(depth = 0) {
+  if (depth > MAX_DEQUEUE_RECURSION_DEPTH) {
+    log(
+      `Reached the max recursion depth (${MAX_DEQUEUE_RECURSION_DEPTH}) of dequeue<->evict calls in a single run -- stopping here rather than risking a runaway loop. Whatever's left in the queue will be picked up by the next real trigger (push, label, or the watchdog).`,
+    )
+    return
+  }
+
   const inFlight = getVar('MERGE_QUEUE_PR')
   if (inFlight) {
     log(`Already in flight: PR #${inFlight}. Nothing to do.`)
@@ -263,6 +290,7 @@ async function dequeue() {
     await evict(
       next.number,
       `Could not update with \`${TARGET_BRANCH}\`, most likely a merge conflict. Resolve the conflict manually, then re-add \`${READY_LABEL}\`.`,
+      depth,
     )
     return
   }
