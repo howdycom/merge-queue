@@ -377,7 +377,14 @@ async function watchdog() {
   const pr = getVar('MERGE_QUEUE_PR')
   const claimedAt = getVar('MERGE_QUEUE_CLAIMED_AT')
   if (!pr || !claimedAt) {
-    log('Queue is idle. Nothing to do.')
+    // Also the self-heal path for the recursion-depth cutoff in dequeue():
+    // if a pathological run evicted MAX_DEQUEUE_RECURSION_DEPTH PRs in a
+    // single chain and stopped, the queue is left idle even though ready
+    // PRs may still be waiting -- nothing else guarantees a push/label
+    // event happens afterward. dequeue() itself is a safe no-op if the
+    // queue is genuinely empty, so it's fine to just always try.
+    log('Queue is idle. Trying a dequeue in case ready PRs are still waiting.')
+    await dequeue()
     return
   }
 
