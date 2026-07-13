@@ -55,7 +55,7 @@ jobs:
       tier1_title_regex: '^\[HOTFIX\]'
       tier2_title_regex: '^\[HCP-'
     secrets:
-      github_token: ${{ secrets.MERGE_QUEUE_GITHUB_TOKEN }}
+      merge_queue_pat: ${{ secrets.MERGE_QUEUE_GITHUB_TOKEN }}
 ```
 
 ### How the merge queue works
@@ -95,7 +95,8 @@ Check/set these up before wiring in the caller workflow above:
 1. **Two new labels must exist** in the consumer repo: `merge-queue: processing` and `requires action` (or whatever you pass via `processing_label`/`requires_action_label` — defaults shown). System-owned; humans shouldn't need to touch them. The "ready" label (default `ready to merge`) is expected to already exist as part of your existing PR workflow.
 2. **`allow_auto_merge` must be enabled** at the repo level (Settings → General → Pull Requests).
 3. **`target_branch` needs required status checks configured** in its branch protection — that's what auto-merge is actually waiting on. Check via `gh api repos/{owner}/{repo}/branches/{branch}/protection`.
-4. **A fine-grained PAT** scoped per the security note below, added as a repo secret and passed as `secrets.github_token`.
+4. **A fine-grained PAT** scoped per the security note below, added as a repo secret and passed as `secrets.merge_queue_pat` (not `github_token` — that name is reserved by GitHub and will fail workflow validation entirely, silently breaking every trigger type).
+5. **`Settings → Actions → General → Access`** on *this* repo (`howdycom/workflows`) must allow the consumer's org/repo to use its reusable workflows — otherwise every run fails with a generic "workflow file issue" and zero jobs, regardless of anything correct in the consumer's own file.
 
 ### Security notes for merge-queue consumers
 
