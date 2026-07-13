@@ -42,7 +42,13 @@ on:
         type: string
         default: 'ubuntu-slim'
     secrets:
-      github_token:
+      # Named merge_queue_pat, not github_token: GitHub reserves the name
+      # `github_token` as a system secret and rejects any workflow_call
+      # secret declared with that exact name at validation time -- this
+      # broke every single run since the reusable workflow was first
+      # added, regardless of any other fix, since it's a hard schema
+      # validation failure, not a runtime error.
+      merge_queue_pat:
         description: >
           PAT scoped to this repo with Contents (write), Pull requests
           (write), and Variables (read/write) -- GITHUB_TOKEN cannot write
@@ -64,7 +70,7 @@ jobs:
         uses: howdycom/workflows/actions/merge-queue@v1
         with:
           command: dequeue
-          github_token: ${{ secrets.github_token }}
+          github_token: ${{ secrets.merge_queue_pat }}
           target_branch: ${{ inputs.target_branch }}
           merge_method: ${{ inputs.merge_method }}
           ready_label: ${{ inputs.ready_label }}
@@ -86,7 +92,7 @@ jobs:
         uses: howdycom/workflows/actions/merge-queue@v1
         with:
           command: check-completion
-          github_token: ${{ secrets.github_token }}
+          github_token: ${{ secrets.merge_queue_pat }}
           target_branch: ${{ inputs.target_branch }}
           ready_label: ${{ inputs.ready_label }}
           processing_label: ${{ inputs.processing_label }}
@@ -109,7 +115,7 @@ jobs:
         uses: howdycom/workflows/actions/merge-queue@v1
         with:
           command: cleanup
-          github_token: ${{ secrets.github_token }}
+          github_token: ${{ secrets.merge_queue_pat }}
           target_branch: ${{ inputs.target_branch }}
           processing_label: ${{ inputs.processing_label }}
           event_pr_number: ${{ github.event.pull_request.number }}
@@ -124,7 +130,7 @@ jobs:
         uses: howdycom/workflows/actions/merge-queue@v1
         with:
           command: watchdog
-          github_token: ${{ secrets.github_token }}
+          github_token: ${{ secrets.merge_queue_pat }}
           target_branch: ${{ inputs.target_branch }}
           ready_label: ${{ inputs.ready_label }}
           processing_label: ${{ inputs.processing_label }}
