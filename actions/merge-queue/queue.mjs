@@ -2,14 +2,19 @@
 // Zero-dependency Node script implementing the merge-queue state machine.
 // Commands: dequeue | check-completion | cleanup | watchdog (see action.yml).
 //
-// State lives in three repo Actions variables (requires a PAT -- GITHUB_TOKEN
+// State lives in repo Actions variables (requires a PAT -- GITHUB_TOKEN
 // cannot write repo variables, see the design proposal's cost-model section
 // for why a file-based alternative was rejected):
-//   MERGE_QUEUE_PR         - PR number currently in flight, or unset if idle
-//   MERGE_QUEUE_SHA        - head SHA we're watching checks for ("pending"
-//                            between claiming a PR and update-branch settling)
-//   MERGE_QUEUE_CLAIMED_AT - ISO8601 timestamp of when the PR was claimed,
-//                            used only by the watchdog command
+//   MERGE_QUEUE_PR              - PR number currently in flight, or unset if idle
+//   MERGE_QUEUE_SHA             - head SHA we're watching checks for ("pending"
+//                                 between claiming a PR and update-branch settling)
+//   MERGE_QUEUE_CLAIMED_AT      - ISO8601 timestamp of when the PR was claimed,
+//                                 used only by the watchdog command
+//   MERGE_QUEUE_UPDATE_FAIL_PR/
+//   MERGE_QUEUE_UPDATE_FAIL_COUNT - consecutive non-conflict update-branch
+//                                 failures for a specific PR, used only to
+//                                 evict after MAX_UPDATE_BRANCH_RETRIES
+//                                 instead of retrying the same PR forever
 import { execFileSync } from 'node:child_process'
 
 const REPO = requireEnv('GITHUB_REPOSITORY')
@@ -38,6 +43,16 @@ const UPDATE_BRANCH_POLL_INTERVAL_MS = 5000
 // PR could get reselected and re-evicted in a tight loop. This is a hard
 // ceiling independent of that, not a realistic queue-depth estimate.
 const MAX_DEQUEUE_RECURSION_DEPTH = 20
+// How many consecutive non-conflict update-branch failures the *same* PR
+// gets before it's evicted instead of released for another retry. Without
+// this, a permanent-but-not-a-conflict failure (a fork PR this token can't
+// update, a branch protection quirk, etc.) reselects the same PR forever --
+// dequeue() always sorts to the same tier/readySince-oldest candidate, so
+// nothing behind it in the queue is ever reached, even though a transient
+// or system-wide failure (a token permission gap, say) deserves a retry
+// rather than an immediate eviction. See MERGE_QUEUE_UPDATE_FAIL_PR /
+// MERGE_QUEUE_UPDATE_FAIL_COUNT below.
+const MAX_UPDATE_BRANCH_RETRIES = 3
 
 function requireEnv(name) {
   const value = process.env[name]
@@ -285,6 +300,8 @@ async function dequeue(depth = 0) {
       // Already current with the target branch -- not a failure, proceed
       // to watch the existing head SHA.
       log(`PR #${next.number} is already up to date with ${TARGET_BRANCH}.`)
+      deleteVar('MERGE_QUEUE_UPDATE_FAIL_PR')
+      deleteVar('MERGE_QUEUE_UPDATE_FAIL_COUNT')
       setVar('MERGE_QUEUE_SHA', before)
       return
     }
@@ -306,23 +323,56 @@ async function dequeue(depth = 0) {
       return
     }
 
-    // Not a real conflict -- most likely transient or a merge-queue-token
-    // permission problem, not something the PR author can fix. Don't evict
-    // a healthy PR for an infra-side failure. Release the claim (instead of
-    // leaving MERGE_QUEUE_PR set and MERGE_QUEUE_SHA stuck at 'pending')
-    // so the queue isn't blocked until the watchdog's stale-timeout fires:
-    // dequeue() no-ops whenever a PR is already claimed, and check-completion
-    // can never match a 'pending' SHA against a real workflow_run, so
-    // without this the *entire* queue -- not just this PR -- would sit
-    // frozen for up to stale_after_minutes even after the underlying
-    // problem is fixed. Still fail the job loudly (throw) so an operator
-    // notices in the Actions tab; the next push/label trigger will retry.
+    // Not a real conflict -- most likely transient (or a merge-queue-token
+    // permission problem), not something the PR author can fix. Don't evict
+    // a healthy PR for an infra-side failure on the first attempt: release
+    // the claim (instead of leaving MERGE_QUEUE_PR set and MERGE_QUEUE_SHA
+    // stuck at 'pending') so the queue isn't blocked until the watchdog's
+    // stale-timeout fires -- dequeue() no-ops whenever a PR is already
+    // claimed, and check-completion can never match a 'pending' SHA against
+    // a real workflow_run, so without this the *entire* queue would sit
+    // frozen for up to stale_after_minutes even after the problem is fixed.
+    //
+    // But if the *same* PR keeps failing this way, it's not a one-off
+    // transient blip -- dequeue() always re-sorts to the same tier/
+    // readySince-oldest candidate, so an unlucky PR with a permanent,
+    // PR-specific reason for failing (a fork branch this token can't
+    // update, some other per-PR quirk) would get reselected and fail again
+    // on every subsequent trigger forever, starving everything behind it in
+    // the queue. Track consecutive failures per PR and evict once that
+    // exceeds MAX_UPDATE_BRANCH_RETRIES, rather than retrying indefinitely.
+    const lastFailedPr = getVar('MERGE_QUEUE_UPDATE_FAIL_PR')
+    const priorAttempts = lastFailedPr === String(next.number) ? Number(getVar('MERGE_QUEUE_UPDATE_FAIL_COUNT') || '0') : 0
+    const attempts = priorAttempts + 1
+
     removeLabel(next.number, PROCESSING_LABEL)
     clearQueueState()
+
+    if (attempts >= MAX_UPDATE_BRANCH_RETRIES) {
+      deleteVar('MERGE_QUEUE_UPDATE_FAIL_PR')
+      deleteVar('MERGE_QUEUE_UPDATE_FAIL_COUNT')
+      await evict(
+        next.number,
+        `Could not update with \`${TARGET_BRANCH}\` after ${attempts} attempts, and GitHub does not report this as a merge conflict (mergeable=${mergeable}). This looks like a PR-specific or persistent problem rather than a one-off transient failure -- check the workflow run logs, fix the underlying issue, then re-add \`${READY_LABEL}\`.`,
+        depth,
+      )
+      throw new Error(
+        `update-branch failed for PR #${next.number} ${attempts} times in a row (not a merge conflict) -- evicted. Raw error: ${message}`,
+      )
+    }
+
+    setVar('MERGE_QUEUE_UPDATE_FAIL_PR', String(next.number))
+    setVar('MERGE_QUEUE_UPDATE_FAIL_COUNT', String(attempts))
     throw new Error(
-      `update-branch failed for PR #${next.number} but GitHub reports mergeable=${mergeable} (not CONFLICTING) -- this is not a merge conflict. Raw error: ${message}`,
+      `update-branch failed for PR #${next.number} but GitHub reports mergeable=${mergeable} (not CONFLICTING) -- this is not a merge conflict. Attempt ${attempts}/${MAX_UPDATE_BRANCH_RETRIES} before eviction. Raw error: ${message}`,
     )
   }
+
+  // The PUT call itself succeeded -- clear any consecutive-failure tracking
+  // for this PR so a past transient blip doesn't count towards a future,
+  // unrelated failure streak.
+  deleteVar('MERGE_QUEUE_UPDATE_FAIL_PR')
+  deleteVar('MERGE_QUEUE_UPDATE_FAIL_COUNT')
 
   // update-branch is asynchronous (202 accepted) -- poll briefly for the
   // head SHA to actually change before trusting it as the SHA to watch.
