@@ -279,7 +279,8 @@ async function dequeue(depth = 0) {
   try {
     gh(['api', '-X', 'PUT', `repos/${REPO}/pulls/${next.number}/update-branch`])
   } catch (err) {
-    const message = String(err.message || err)
+    const message = String(err.stderr || err.message || err)
+    log(`update-branch failed for PR #${next.number}: ${message}`)
     if (/up.to.date|not.*behind/i.test(message)) {
       // Already current with the target branch -- not a failure, proceed
       // to watch the existing head SHA.
@@ -287,12 +288,33 @@ async function dequeue(depth = 0) {
       setVar('MERGE_QUEUE_SHA', before)
       return
     }
-    await evict(
-      next.number,
-      `Could not update with \`${TARGET_BRANCH}\`, most likely a merge conflict. Resolve the conflict manually, then re-add \`${READY_LABEL}\`.`,
-      depth,
+
+    // Don't assume "merge conflict" from the error alone -- ask GitHub's
+    // own mergeable state, which is authoritative. A prior version of this
+    // code guessed "most likely a merge conflict" for *any* update-branch
+    // error and evicted on that assumption; in production this mislabeled
+    // several genuinely conflict-free, approved PRs (GitHub reported them
+    // as MERGEABLE) as needing manual conflict resolution, when the real
+    // cause was an unrelated token/permission problem on our side.
+    const mergeable = ghJson(['pr', 'view', String(next.number), '--json', 'mergeable']).mergeable
+    if (mergeable === 'CONFLICTING') {
+      await evict(
+        next.number,
+        `Could not update with \`${TARGET_BRANCH}\`: real merge conflict (GitHub reports this PR as CONFLICTING). Resolve the conflict manually, then re-add \`${READY_LABEL}\`.`,
+        depth,
+      )
+      return
+    }
+
+    // Not a real conflict -- most likely transient or a merge-queue-token
+    // permission problem, not something the PR author can fix. Don't evict
+    // a healthy PR for an infra-side failure: fail the job loudly instead
+    // so an operator notices in the Actions tab, and leave the PR claimed
+    // so the watchdog's stale-timeout is the fallback if this doesn't
+    // resolve on its own before then.
+    throw new Error(
+      `update-branch failed for PR #${next.number} but GitHub reports mergeable=${mergeable} (not CONFLICTING) -- this is not a merge conflict. Raw error: ${message}`,
     )
-    return
   }
 
   // update-branch is asynchronous (202 accepted) -- poll briefly for the
