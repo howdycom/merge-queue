@@ -36,6 +36,12 @@ const EVENT_ACTION = process.env.MQ_EVENT_ACTION || ''
 const DRY_RUN = process.env.MQ_DRY_RUN === 'true'
 const UPDATE_BRANCH_POLL_ATTEMPTS = 12
 const UPDATE_BRANCH_POLL_INTERVAL_MS = 5000
+// Short poll for GitHub's mergeable computation to settle out of UNKNOWN
+// after a failed update-branch call, before trusting it to decide whether
+// a failure was a real conflict. Much shorter than the SHA-settle poll
+// above -- this is normally quick, and it's already inside a failure path.
+const MERGEABLE_POLL_ATTEMPTS = 5
+const MERGEABLE_POLL_INTERVAL_MS = 3000
 // Backstop for the dequeue<->evict recursion below. Bounded in the normal
 // case by how many PRs are actually ready (each eviction removes one from
 // candidacy), but that assumption depends on removeLabel(READY_LABEL)
@@ -313,7 +319,16 @@ async function dequeue(depth = 0) {
     // several genuinely conflict-free, approved PRs (GitHub reported them
     // as MERGEABLE) as needing manual conflict resolution, when the real
     // cause was an unrelated token/permission problem on our side.
-    const mergeable = ghJson(['pr', 'view', String(next.number), '--json', 'mergeable']).mergeable
+    // mergeable can be UNKNOWN right after a push while GitHub is still
+    // computing it (see the mergeableState enum docs) -- poll briefly
+    // rather than treat a not-yet-computed result as "not a conflict",
+    // which would misdiagnose a real conflict that just hasn't resolved
+    // yet with the misleading "not a merge conflict" retry message.
+    let mergeable = ghJson(['pr', 'view', String(next.number), '--json', 'mergeable']).mergeable
+    for (let attempt = 0; mergeable === 'UNKNOWN' && attempt < MERGEABLE_POLL_ATTEMPTS; attempt++) {
+      await sleep(MERGEABLE_POLL_INTERVAL_MS)
+      mergeable = ghJson(['pr', 'view', String(next.number), '--json', 'mergeable']).mergeable
+    }
     if (mergeable === 'CONFLICTING') {
       await evict(
         next.number,
