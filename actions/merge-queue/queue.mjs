@@ -308,10 +308,17 @@ async function dequeue(depth = 0) {
 
     // Not a real conflict -- most likely transient or a merge-queue-token
     // permission problem, not something the PR author can fix. Don't evict
-    // a healthy PR for an infra-side failure: fail the job loudly instead
-    // so an operator notices in the Actions tab, and leave the PR claimed
-    // so the watchdog's stale-timeout is the fallback if this doesn't
-    // resolve on its own before then.
+    // a healthy PR for an infra-side failure. Release the claim (instead of
+    // leaving MERGE_QUEUE_PR set and MERGE_QUEUE_SHA stuck at 'pending')
+    // so the queue isn't blocked until the watchdog's stale-timeout fires:
+    // dequeue() no-ops whenever a PR is already claimed, and check-completion
+    // can never match a 'pending' SHA against a real workflow_run, so
+    // without this the *entire* queue -- not just this PR -- would sit
+    // frozen for up to stale_after_minutes even after the underlying
+    // problem is fixed. Still fail the job loudly (throw) so an operator
+    // notices in the Actions tab; the next push/label trigger will retry.
+    removeLabel(next.number, PROCESSING_LABEL)
+    clearQueueState()
     throw new Error(
       `update-branch failed for PR #${next.number} but GitHub reports mergeable=${mergeable} (not CONFLICTING) -- this is not a merge conflict. Raw error: ${message}`,
     )
