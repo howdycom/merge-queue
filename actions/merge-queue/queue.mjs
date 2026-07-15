@@ -345,10 +345,14 @@ async function dequeue(depth = 0) {
     const priorAttempts = lastFailedPr === String(next.number) ? Number(getVar('MERGE_QUEUE_UPDATE_FAIL_COUNT') || '0') : 0
     const attempts = priorAttempts + 1
 
-    removeLabel(next.number, PROCESSING_LABEL)
-    clearQueueState()
-
     if (attempts >= MAX_UPDATE_BRANCH_RETRIES) {
+      // Let evict() clear the queue state itself, rather than doing it here
+      // first -- evict()'s own dequeue(depth + 1) chaining (which advances
+      // the queue to the next ready PR, the same as every other eviction
+      // path) is gated on MERGE_QUEUE_PR still matching this PR number.
+      // Clearing it beforehand would make that guard false and silently
+      // leave the queue idle until an unrelated trigger fired, exactly the
+      // stuck-queue failure mode this whole fix exists to avoid.
       deleteVar('MERGE_QUEUE_UPDATE_FAIL_PR')
       deleteVar('MERGE_QUEUE_UPDATE_FAIL_COUNT')
       await evict(
@@ -361,6 +365,8 @@ async function dequeue(depth = 0) {
       )
     }
 
+    removeLabel(next.number, PROCESSING_LABEL)
+    clearQueueState()
     setVar('MERGE_QUEUE_UPDATE_FAIL_PR', String(next.number))
     setVar('MERGE_QUEUE_UPDATE_FAIL_COUNT', String(attempts))
     throw new Error(
