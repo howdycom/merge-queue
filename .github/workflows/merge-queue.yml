@@ -87,6 +87,15 @@ jobs:
       vars.MERGE_QUEUE_SHA != '' &&
       github.event.workflow_run.head_sha == vars.MERGE_QUEUE_SHA
     runs-on: ${{ inputs.runs_on }}
+    permissions:
+      # Fine-grained PATs can't read check-run results created by other Apps
+      # via GraphQL, no matter what repository permission is granted --
+      # confirmed the hard way (every required check except the one plain
+      # commit status failed to resolve, even with Commit statuses: read).
+      # The default GITHUB_TOKEN has checks: read for its own repo/run out
+      # of the box, so this job's own token is used for that one read-only
+      # query instead -- everything else still goes through the PAT.
+      checks: read
     steps:
       - name: Check in-flight PR's required checks
         uses: howdycom/workflows/actions/merge-queue@v1
