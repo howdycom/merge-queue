@@ -105,10 +105,17 @@ jobs:
       # all, it resolves the PR by number first (Finder.Find/findByNumber),
       # which reads repository.pullRequest { id, number, headRefName } and
       # fails without this if unspecified permissions default to none.
+      # Also needs contents: read -- the rollup query itself starts from
+      # commits(last: 1) on the PR, which needs read access to the commit/
+      # ref data before it can even reach statusCheckRollup; confirmed in
+      # production ("Resource not accessible by integration
+      # (node.statusCheckRollup.nodes.0)") after granting the four above
+      # without it.
       checks: read
       statuses: read
       actions: read
       pull-requests: read
+      contents: read
     steps:
       - name: Check in-flight PR's required checks
         uses: howdycom/workflows/actions/merge-queue@v1
