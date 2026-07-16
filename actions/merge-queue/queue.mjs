@@ -326,9 +326,14 @@ async function dequeue(depth = 0) {
   } catch (err) {
     const message = String(err.stderr || err.message || err)
     log(`update-branch failed for PR #${next.number}: ${message}`)
-    if (/up.to.date|not.*behind/i.test(message)) {
+    if (/up.to.date|not.*behind|no new commits on the base branch/i.test(message)) {
       // Already current with the target branch -- not a failure, proceed
-      // to watch the existing head SHA.
+      // to watch the existing head SHA. "no new commits on the base
+      // branch" is the exact phrasing `gh api -X PUT .../update-branch`
+      // actually returns for this case (HTTP 422) -- confirmed in
+      // production, where the original narrower regex missed it and
+      // treated an already-current, perfectly healthy PR as a failure,
+      // incrementing its retry counter toward eviction for no real reason.
       log(`PR #${next.number} is already up to date with ${TARGET_BRANCH}.`)
       deleteVar('MERGE_QUEUE_UPDATE_FAIL_PR')
       deleteVar('MERGE_QUEUE_UPDATE_FAIL_COUNT')
