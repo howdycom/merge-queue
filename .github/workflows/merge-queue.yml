@@ -92,10 +92,18 @@ jobs:
       # via GraphQL, no matter what repository permission is granted --
       # confirmed the hard way (every required check except the one plain
       # commit status failed to resolve, even with Commit statuses: read).
-      # The default GITHUB_TOKEN has checks: read for its own repo/run out
-      # of the box, so this job's own token is used for that one read-only
-      # query instead -- everything else still goes through the PAT.
+      # The default GITHUB_TOKEN has these out of the box for its own
+      # repo/run, so this job's own token is used for the one read-only
+      # `gh pr checks --required` query instead -- everything else still
+      # goes through the PAT. All three below are actually needed: `gh pr
+      # checks`' underlying GraphQL query reads both StatusContext (needs
+      # statuses) and CheckRun -> checkSuite -> workflowRun -> workflow
+      # (needs actions) branches of the same rollup, not just checks --
+      # granting only `checks: read` would still fail on deploy-lock (a
+      # plain commit status) or on the workflow-run traversal.
       checks: read
+      statuses: read
+      actions: read
     steps:
       - name: Check in-flight PR's required checks
         uses: howdycom/workflows/actions/merge-queue@v1
