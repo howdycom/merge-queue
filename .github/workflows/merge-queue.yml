@@ -100,10 +100,15 @@ jobs:
       # statuses) and CheckRun -> checkSuite -> workflowRun -> workflow
       # (needs actions) branches of the same rollup, not just checks --
       # granting only `checks: read` would still fail on deploy-lock (a
-      # plain commit status) or on the workflow-run traversal.
+      # plain commit status) or on the workflow-run traversal. Also needs
+      # pull-requests: read -- before `gh pr checks` queries the rollup at
+      # all, it resolves the PR by number first (Finder.Find/findByNumber),
+      # which reads repository.pullRequest { id, number, headRefName } and
+      # fails without this if unspecified permissions default to none.
       checks: read
       statuses: read
       actions: read
+      pull-requests: read
     steps:
       - name: Check in-flight PR's required checks
         uses: howdycom/workflows/actions/merge-queue@v1
