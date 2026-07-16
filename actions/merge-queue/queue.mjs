@@ -66,8 +66,9 @@ function requireEnv(name) {
   return value
 }
 
-function sh(args) {
-  return execFileSync(args[0], args.slice(1), { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+function sh(args, envOverride) {
+  const env = envOverride ? { ...process.env, ...envOverride } : process.env
+  return execFileSync(args[0], args.slice(1), { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], env }).trim()
 }
 
 function gh(args) {
@@ -76,6 +77,29 @@ function gh(args) {
 
 function ghJson(args) {
   return JSON.parse(gh(args))
+}
+
+// Fine-grained PATs can't read check-run results (as opposed to legacy
+// commit statuses) created by other Apps via GraphQL, no matter what
+// repository permission is granted -- confirmed the hard way when
+// check-completion's `gh pr checks --required` call failed on every
+// required check except the one plain commit status (deploy-lock), even
+// after adding Commit statuses: read. The default GITHUB_TOKEN has
+// checks: read for its own repo/run out of the box, so this one read-only
+// query uses that instead -- everything else (labels, variables,
+// update-branch) still goes through the PAT, which is why MQ_GITHUB_TOKEN
+// is a distinct, narrower credential rather than a blanket swap.
+function ghAsDefaultToken(args) {
+  if (!process.env.MQ_GITHUB_TOKEN) {
+    throw new Error(
+      'MQ_GITHUB_TOKEN is not set -- the calling job needs `permissions: checks: read` for this to work (see check-completion).',
+    )
+  }
+  return sh(['gh', ...args], { GH_TOKEN: process.env.MQ_GITHUB_TOKEN })
+}
+
+function ghJsonAsDefaultToken(args) {
+  return JSON.parse(ghAsDefaultToken(args))
 }
 
 function ghPaginatedJson(endpoint) {
@@ -425,7 +449,7 @@ async function checkCompletion() {
     return
   }
 
-  const checks = ghJson(['pr', 'checks', pr, '--required', '--json', 'name,bucket'])
+  const checks = ghJsonAsDefaultToken(['pr', 'checks', pr, '--required', '--json', 'name,bucket'])
   const failing = checks.filter((c) => c.bucket === 'fail' || c.bucket === 'cancel')
   if (failing.length === 0) {
     // Enabling auto-merge at claim time (in dequeue) can silently fail if
