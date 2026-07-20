@@ -44,7 +44,11 @@ on:
   workflow_run:
     types: [completed]
   schedule:
-    - cron: '0 */3 * * *'   # watchdog only
+    # Watchdog + idle/BEHIND self-heal. One ubuntu-slim job; keep this
+    # relatively frequent so a stranded in-flight PR recovers without a
+    # multi-hour wait. 30m is a good default; 3h is too slow when develop
+    # advances outside the queue and the in-flight PR goes BEHIND.
+    - cron: '*/30 * * * *'
 
 jobs:
   process:
@@ -63,32 +67,38 @@ jobs:
 A PR gets the `ready to merge` label once it's approved and green. From there it's automatic — no one manually decides "who merges next":
 
 - **Priority order** — not strict FIFO. Configurable via `tier1_labels`/`tier1_title_regex`/`tier2_title_regex`, defaulting to: PRs labeled `bug` or titled `[HOTFIX]...` go first, then PRs titled `[HCP-...]`, then everything else. Within a tier, whoever's been ready longest goes first (read from when `ready to merge` was actually applied, not PR number or creation date).
-- **The happy path is free** — on a push to `target_branch`, the next PR in line gets `update-branch`'d against the latest target and has auto-merge enabled (the workflow does this itself now — see `queue.mjs`'s `enableAutoMerge`, don't rely on the PR author having turned it on already). `dequeue` polls in-job for up to ~60s to confirm the SHA actually changed post-`update-branch` (a bounded wait inside one run, not a recurring trigger), then GitHub's own auto-merge finishes the job once checks re-pass. No cross-run polling and no extra scheduled Action runs for the common case.
-- **Eviction** (removes `ready to merge`, adds `requires action`, comments why) happens on: a merge conflict from `update-branch` (immediate, no checks to wait for), a **required** check failing after the update (optional/advisory check failures don't evict), or the watchdog timing out a PR that's been in flight past `stale_after_minutes` with no resolution. A PR closed, unlabeled, or freshly pushed to while in flight is cleaned up the same way state-wise, but isn't treated as a failure — no `requires action`, no comment.
-- **No stuck queue** — clearing the in-flight PR for any reason (eviction or clean cleanup) immediately tries the next one, rather than waiting for an unrelated event to happen to notice. The only *scheduled, recurring* trigger in the whole system is the watchdog, purely as a last resort for CI that never completes at all — everything else (including the `update-branch` settle-check above) is either event-driven or a bounded wait inside a single run.
+- **One PR at a time** — `MERGE_QUEUE_PR` is the single in-flight claim. New ready PRs wait; only the claimed PR is `update-branch`'d and watched.
+- **The happy path is free** — on a push to `target_branch`, the next PR in line gets `update-branch`'d against the latest target and has auto-merge enabled (the workflow does this itself — see `queue.mjs`'s `enableAutoMerge`). `dequeue` polls in-job for up to ~60s to confirm the SHA actually changed post-`update-branch`, then GitHub's own auto-merge finishes the job once checks re-pass.
+- **Re-sync when the base moves (critical)** — if a PR is already in flight and `target_branch` advances (manual merges, another path landing develop), branch protection with `required_status_checks.strict=true` makes native auto-merge **unable** to finish a `BEHIND` PR. On every subsequent `dequeue` trigger (including push to develop), the queue now **re-evaluates** the in-flight PR via `maintainInFlight`: re-`update-branch` when `mergeStateStatus=BEHIND`, clear and advance when closed/unlabeled, evict on real conflicts. Previously it logged "Already in flight. Nothing to do." and left healthy PRs stranded until the watchdog wrongly `requires action`'d them.
+- **`check-completion` also re-syncs BEHIND** — not only when required checks fail. If checks finish on an old head that is now behind the base, it re-updates instead of "leaving it to native auto-merge" forever.
+- **`synchronize` keeps the claim** — when the in-flight PR's head moves (our `update-branch` or an author push), cleanup refreshes `MERGE_QUEUE_SHA` and re-arms auto-merge. It does **not** clear the claim and re-dequeue (the old path double-claimed every successful update and raced check-completion).
+- **Eviction** (removes `ready to merge`, adds `requires action`, comments why) happens on: a real merge conflict (`mergeable=CONFLICTING`), a **required** check failing after the update, or a watchdog timeout where checks are green but merge still never completed (branch protection / review / deploy-lock investigation needed). Optional/advisory check failures do not evict.
+- **Watchdog is smarter than blind eviction** — every schedule run re-evaluates the in-flight PR first (`maintainInFlight`). Past `stale_after_minutes`: failing required checks → evict with names; still-pending required checks → **soft-requeue** (remove+re-add `ready to merge` so `readySince` moves to now and peers aren't starved, without `requires action`); otherwise evict with a diagnostic message. Successful re-syncs refresh `MERGE_QUEUE_CLAIMED_AT` so a PR that keeps getting legitimately rebased isn't false-evicted mid-CI.
+- **No stuck queue** — clearing the in-flight PR for any reason immediately tries the next one. Retryable non-conflict `update-branch` failures release the claim without failing the Actions run (exit 0) so the Actions tab stays readable.
 
 > **Do not add your own top-level `concurrency:` block to the caller workflow.** This reusable workflow already declares `concurrency: group: merge-queue-${{ github.repository }}` internally, and that applies to `workflow_call` invocations of it. A caller that declares a *second* concurrency block using the same group name creates a self-referential wait -- the caller's own job would need to re-enter a group it's already occupying -- which GitHub rejects outright as an invalid workflow file (every trigger type fails with zero jobs created, no useful error surfaced anywhere in the API or UI). This is exactly what broke every run of the astro-market consumer for 4 days: its caller had its own `concurrency:` block "for local readability," using the identical group name.
 
 **Trigger → job mapping.** The reusable workflow has 4 jobs, each with its own `if:` deciding whether it runs at all — this is the exact gating, not a paraphrase:
 
-| Event | Job | Gate |
+| Event | Job | Gate / behavior |
 |---|---|---|
-| `push` to `target_branch` | `dequeue` | Always tries — the branch filter belongs on the caller's trigger, not this condition |
+| `push` to `target_branch` | `dequeue` | Claims next ready PR **or** re-evaluates the current in-flight PR (re-sync if BEHIND) |
 | `pull_request` `labeled` | `dequeue` | Only if the label added is `ready_label` — any other label does nothing |
-| `pull_request` `closed` / `synchronize` | `cleanup` | Only if the PR number matches `MERGE_QUEUE_PR` — an unrelated PR does nothing |
-| `pull_request` `unlabeled` | `cleanup` | Same PR-number match, **and** the label removed must specifically be `ready_label` — removing an unrelated label from the in-flight PR does nothing |
-| `workflow_run` `completed` | `check-completion` | Only if `workflow_run.head_sha == MERGE_QUEUE_SHA` — every other firing (any other PR, any other SHA) is skipped before a runner is allocated, which is what keeps this free regardless of how often it fires |
-| `schedule` | `watchdog` | Always evaluates; only acts if the in-flight PR has been claimed longer than `stale_after_minutes` |
+| `pull_request` `synchronize` | `cleanup` | Only if PR matches `MERGE_QUEUE_PR` — refreshes watched SHA, **keeps claim** |
+| `pull_request` `closed` | `cleanup` | Only if PR matches `MERGE_QUEUE_PR` — clears claim and dequeues next |
+| `pull_request` `unlabeled` | `cleanup` | Same PR-number match, **and** the label removed must specifically be `ready_label` — clears claim and dequeues next |
+| `workflow_run` `completed` | `check-completion` | Only if `workflow_run.head_sha == MERGE_QUEUE_SHA` — every other firing is skipped before a runner is allocated (free). On match: fail → evict; BEHIND → re-sync; else ensure auto-merge |
+| `schedule` | `watchdog` | Always evaluates: maintain in-flight / soft-requeue / evict / idle dequeue |
 
 **Label lifecycle:**
 
 | Label | Added by | Removed by |
 |---|---|---|
-| `ready_label` (default `ready to merge`) | A human — the only manual step in the whole system | `evict()` on any failure path |
-| `processing_label` (default `merge-queue: processing`) | `dequeue`, immediately after picking a PR — before `update-branch` is even called | `evict()`, or `cleanup` (closed/unlabeled/synchronize) |
+| `ready_label` (default `ready to merge`) | A human — the only manual step in the whole system; also re-added by watchdog soft-requeue | `evict()` on failure paths; temporarily by soft-requeue |
+| `processing_label` (default `merge-queue: processing`) | `dequeue`, immediately after picking a PR — before `update-branch` is even called | `evict()`, cleanup (closed/unlabeled), soft-requeue |
 | `requires_action_label` (default `requires action`) | `evict()` only | Never automatically — a human clears it once the underlying problem is fixed |
 
-**State**, for reference: `MERGE_QUEUE_PR` and `MERGE_QUEUE_CLAIMED_AT` are set the instant a PR is claimed; `MERGE_QUEUE_SHA` starts as the literal string `"pending"` and is updated to the real post-`update-branch` SHA once it's confirmed (`dequeue` polls for the head SHA to change, up to 12 times / 5s apart) — that's the exact value `check-completion`'s trigger condition compares against. All three are deleted together by whichever of `evict()`/`cleanup()` runs.
+**State**, for reference: `MERGE_QUEUE_PR` and `MERGE_QUEUE_CLAIMED_AT` are set the instant a PR is claimed (and `CLAIMED_AT` is refreshed on every successful re-sync); `MERGE_QUEUE_SHA` starts as the literal string `"pending"` and is updated to the real post-`update-branch` SHA once it's confirmed (`updateBranchAndWatch` polls for the head SHA to change, up to 12 times / 5s apart) — that's the exact value `check-completion`'s trigger condition compares against. All three are deleted together by whichever of `evict()` / cleanup (closed/unlabeled) / soft-requeue runs.
 
 ### Prerequisites for a new consumer repo
 

@@ -31,7 +31,12 @@ on:
         type: string
         default: '^\[HCP-'
       stale_after_minutes:
-        description: 'Watchdog: evict the in-flight PR if claimed longer than this with no resolution.'
+        description: >
+          Watchdog budget for a single claim. Past this, failing required
+          checks evict; still-pending required checks soft-requeue (keep
+          ready label, move to back of tier); otherwise diagnostic eviction.
+          Successful re-syncs refresh the claim clock, so a PR that keeps
+          getting legitimately rebased is not false-evicted mid-CI.
         type: number
         default: 90
       dry_run:
@@ -140,7 +145,7 @@ jobs:
       )
     runs-on: ${{ inputs.runs_on }}
     steps:
-      - name: Clear stale in-flight state
+      - name: Handle in-flight PR closed / unlabeled / synchronize
         uses: howdycom/workflows/actions/merge-queue@v1
         with:
           command: cleanup
@@ -155,7 +160,7 @@ jobs:
     if: github.event_name == 'schedule'
     runs-on: ${{ inputs.runs_on }}
     steps:
-      - name: Evict a hung in-flight PR
+      - name: Maintain in-flight PR / soft-requeue / evict / idle dequeue
         uses: howdycom/workflows/actions/merge-queue@v1
         with:
           command: watchdog
