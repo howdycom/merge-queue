@@ -51,7 +51,12 @@ inputs:
     required: false
     default: '^\[HCP-'
   stale_after_minutes:
-    description: 'For the watchdog command: evict the in-flight PR if it has been claimed longer than this with no resolution.'
+    description: >
+      For the watchdog command: wall-clock minutes since FIRST claim
+      (MERGE_QUEUE_CLAIMED_AT). Past this budget: failing required checks
+      evict; pending/cancelled required checks soft-requeue; otherwise
+      diagnostic eviction. Successful BEHIND re-syncs update progress only
+      and do not reset this budget.
     required: false
     default: '90'
   event_pr_number:

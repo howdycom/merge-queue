@@ -32,11 +32,13 @@ on:
         default: '^\[HCP-'
       stale_after_minutes:
         description: >
-          Watchdog budget for a single claim. Past this, failing required
-          checks evict; still-pending required checks soft-requeue (keep
-          ready label, move to back of tier); otherwise diagnostic eviction.
-          Successful re-syncs refresh the claim clock, so a PR that keeps
-          getting legitimately rebased is not false-evicted mid-CI.
+          Wall-clock minutes since FIRST claim (MERGE_QUEUE_CLAIMED_AT).
+          Past this: failing required checks evict; pending/cancelled
+          required checks soft-requeue (keep ready label, move to back of
+          tier); otherwise diagnostic eviction. Successful BEHIND re-syncs
+          update MERGE_QUEUE_LAST_PROGRESS_AT only — they do not reset the
+          wall-clock hang budget (refreshing CLAIMED_AT previously
+          immortalized stuck claims when the base advanced).
         type: number
         default: 90
       dry_run:

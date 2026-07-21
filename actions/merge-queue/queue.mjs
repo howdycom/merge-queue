@@ -8,8 +8,16 @@
 //   MERGE_QUEUE_PR              - PR number currently in flight, or unset if idle
 //   MERGE_QUEUE_SHA             - head SHA we're watching checks for ("pending"
 //                                 between claiming a PR and update-branch settling)
-//   MERGE_QUEUE_CLAIMED_AT      - ISO8601 timestamp of when the PR was claimed
-//                                 (or last successfully re-synced), used by watchdog
+//   MERGE_QUEUE_CLAIMED_AT      - ISO8601 timestamp of FIRST claim only (wall-clock
+//                                 hang budget for the watchdog). Never refreshed
+//                                 on BEHIND re-sync — refreshing it previously
+//                                 immortalized stuck claims whenever develop
+//                                 advanced (astro-market #3875: 3h+ wall clock
+//                                 while watchdog always logged "under 90m").
+//   MERGE_QUEUE_LAST_PROGRESS_AT - ISO8601 of last successful update-branch /
+//                                 head SHA progress. Updated on re-sync so logs
+//                                 can show "still making progress" without
+//                                 resetting the hang budget.
 //   MERGE_QUEUE_UPDATE_FAIL_PR/
 //   MERGE_QUEUE_UPDATE_FAIL_COUNT - consecutive non-conflict update-branch
 //                                 failures for a specific PR, used only to
@@ -34,6 +42,10 @@ const STALE_AFTER_MINUTES = Number(process.env.MQ_STALE_AFTER_MINUTES || '90')
 const EVENT_PR_NUMBER = process.env.MQ_EVENT_PR_NUMBER || ''
 const EVENT_ACTION = process.env.MQ_EVENT_ACTION || ''
 const DRY_RUN = process.env.MQ_DRY_RUN === 'true'
+// When true (default), only PRs with reviewDecision=APPROVED may enter or
+// stay in the queue. Set MQ_REQUIRE_APPROVED=false only for repos that do
+// not use required reviews on the target branch.
+const REQUIRE_APPROVED = process.env.MQ_REQUIRE_APPROVED !== 'false'
 const UPDATE_BRANCH_POLL_ATTEMPTS = 12
 const UPDATE_BRANCH_POLL_INTERVAL_MS = 5000
 // Short poll for GitHub's mergeable computation to settle out of UNKNOWN
@@ -166,6 +178,7 @@ function clearQueueState() {
   deleteVar('MERGE_QUEUE_PR')
   deleteVar('MERGE_QUEUE_SHA')
   deleteVar('MERGE_QUEUE_CLAIMED_AT')
+  deleteVar('MERGE_QUEUE_LAST_PROGRESS_AT')
 }
 
 // ---- PR mutations ----
@@ -227,8 +240,47 @@ function viewPr(prNumber) {
     'view',
     String(prNumber),
     '--json',
-    'state,mergeable,mergeStateStatus,headRefOid,labels,autoMergeRequest,title',
+    'state,mergeable,mergeStateStatus,headRefOid,labels,autoMergeRequest,title,reviewDecision,isDraft',
   ])
+}
+
+/**
+ * Returns null if the PR is eligible for the merge queue, or a short human
+ * reason if it is not. Used both pre-claim (dequeue filter) and in-flight
+ * (immediate eviction when a claim becomes unmergeable).
+ *
+ * Production failure this closes: ready-labeled PRs with outstanding
+ * CHANGES_REQUESTED (astro-market #3875) were claimed and held the single-
+ * flight slot for hours because native auto-merge can never finish them
+ * under required-review branch protection.
+ */
+function ineligibilityReason(pr) {
+  if (pr.isDraft) return 'PR is still a draft'
+  const names = (pr.labels || []).map((l) => l.name)
+  if (names.includes(REQUIRES_ACTION_LABEL)) {
+    return `still has \`${REQUIRES_ACTION_LABEL}\` (clear it after fixing the issue, then re-add \`${READY_LABEL}\`)`
+  }
+  if (REQUIRE_APPROVED) {
+    const rd = pr.reviewDecision || ''
+    if (rd === 'CHANGES_REQUESTED') {
+      return 'reviewDecision=CHANGES_REQUESTED (outstanding changes-requested review blocks merge)'
+    }
+    if (rd === 'REVIEW_REQUIRED') {
+      return 'reviewDecision=REVIEW_REQUIRED (approvals / code owners not satisfied)'
+    }
+    if (rd !== 'APPROVED') {
+      return `reviewDecision=${rd || '(empty)'} (APPROVED required to enter the queue; set MQ_REQUIRE_APPROVED=false only if the target branch does not require reviews)`
+    }
+  }
+  return null
+}
+
+function isEligibleReadyPr(pr) {
+  return ineligibilityReason(pr) === null
+}
+
+function markProgress() {
+  setVar('MERGE_QUEUE_LAST_PROGRESS_AT', new Date().toISOString())
 }
 
 async function resolveMergeable(prNumber, initialMergeable) {
@@ -317,6 +369,7 @@ async function updateBranchAndWatch(prNumber, depth = 0) {
       deleteVar('MERGE_QUEUE_UPDATE_FAIL_PR')
       deleteVar('MERGE_QUEUE_UPDATE_FAIL_COUNT')
       setVar('MERGE_QUEUE_SHA', before)
+      markProgress()
       return 'watching'
     }
 
@@ -426,12 +479,13 @@ async function updateBranchAndWatch(prNumber, depth = 0) {
     )
   }
 
-  // Refresh the claim clock on every successful update/re-sync so a PR that
-  // keeps getting rebased by external develop advances isn't falsely
-  // watchdog-evicted mid-CI for "90 minutes stuck" when each rebase is
-  // legitimate progress.
-  setVar('MERGE_QUEUE_CLAIMED_AT', new Date().toISOString())
+  // Progress only. Wall-clock CLAIMED_AT stays fixed so a permanently
+  // unmergeable PR that keeps getting rebased by external base-branch
+  // advances cannot immortalize its hang timer. Healthy mid-CI PRs that
+  // still have pending required checks are soft-requeued past the wall
+  // budget (not hard-evicted), so legitimate re-syncs are safe.
   setVar('MERGE_QUEUE_SHA', newSha)
+  markProgress()
   log(`Now watching PR #${prNumber} at ${newSha}.`)
   return 'watching'
 }
@@ -481,6 +535,18 @@ async function maintainInFlight(prNumber, depth = 0) {
     return
   }
 
+  // Immediate eviction for unmergeable claims (review / dual-label / draft).
+  // Do not wait for the wall-clock budget — auto-merge can never finish these.
+  const ineligible = ineligibilityReason(snap)
+  if (ineligible) {
+    await evict(
+      prNumber,
+      `In-flight PR is not mergeable via auto-merge: ${ineligible}. Re-add \`${READY_LABEL}\` only after this is fixed.`,
+      depth,
+    )
+    return
+  }
+
   const mergeable = await resolveMergeable(prNumber, snap.mergeable)
   // Re-read mergeStateStatus after any UNKNOWN settle -- cheap and more
   // accurate if GitHub finished computing during the poll above.
@@ -514,6 +580,7 @@ async function maintainInFlight(prNumber, depth = 0) {
   if (!trackedSha || trackedSha === 'pending' || trackedSha !== headRefOid) {
     log(`Refreshing MERGE_QUEUE_SHA for PR #${prNumber}: ${trackedSha || '(unset)'} -> ${headRefOid}`)
     setVar('MERGE_QUEUE_SHA', headRefOid)
+    markProgress()
   }
 
   if (!status.autoMergeRequest) {
@@ -577,31 +644,36 @@ async function dequeue(depth = 0) {
     '--label',
     READY_LABEL,
     '--json',
-    'number,title,labels,createdAt',
+    'number,title,labels,createdAt,reviewDecision,isDraft',
   ])
   if (prs.length === 0) {
     log('Queue is empty.')
     return
   }
 
-  // A PR can end up with both `ready to merge` and `requires action` when a
-  // human re-adds ready without first clearing the eviction label. Those
-  // PRs are NOT ready candidates — they still need the underlying failure
-  // fixed. Without this filter, dequeue re-claims the same previously
-  // evicted PR (oldest readySince often wins) and re-blocks the queue.
-  const eligible = prs.filter((pr) => {
-    const names = (pr.labels || []).map((l) => l.name)
-    return !names.includes(REQUIRES_ACTION_LABEL)
-  })
-  const skipped = prs.length - eligible.length
+  // Eligibility is broader than the ready label alone:
+  //  - still has `requires action` (human re-added ready without clearing eviction)
+  //  - draft
+  //  - reviewDecision not APPROVED (when MQ_REQUIRE_APPROVED, default true)
+  // Without this, dequeue claims PRs native auto-merge can never finish
+  // (e.g. CHANGES_REQUESTED) and blocks the entire single-flight queue.
+  const eligible = []
+  let skipped = 0
+  for (const pr of prs) {
+    const why = ineligibilityReason(pr)
+    if (why) {
+      skipped += 1
+      log(`Skipping PR #${pr.number}: ${why}`)
+      continue
+    }
+    eligible.push(pr)
+  }
   if (skipped > 0) {
-    log(
-      `Skipping ${skipped} PR(s) that still have \`${REQUIRES_ACTION_LABEL}\` alongside \`${READY_LABEL}\`. Clear \`${REQUIRES_ACTION_LABEL}\` after fixing the issue, then re-add \`${READY_LABEL}\`.`,
-    )
+    log(`Skipped ${skipped} ready-labeled PR(s) that are not eligible for the queue.`)
   }
   if (eligible.length === 0) {
     log(
-      `Queue has ${prs.length} ready-labeled PR(s) but none are eligible (all still marked \`${REQUIRES_ACTION_LABEL}\`). Nothing to dequeue.`,
+      `Queue has ${prs.length} ready-labeled PR(s) but none are eligible. Nothing to dequeue.`,
     )
     return
   }
@@ -624,7 +696,9 @@ async function dequeue(depth = 0) {
   // "stuck in flight" (catchable by the watchdog) rather than invisible.
   setVar('MERGE_QUEUE_PR', String(next.number))
   setVar('MERGE_QUEUE_SHA', 'pending')
-  setVar('MERGE_QUEUE_CLAIMED_AT', new Date().toISOString())
+  const claimedAt = new Date().toISOString()
+  setVar('MERGE_QUEUE_CLAIMED_AT', claimedAt) // wall-clock first claim — never refresh on re-sync
+  setVar('MERGE_QUEUE_LAST_PROGRESS_AT', claimedAt)
   addLabel(next.number, PROCESSING_LABEL)
   // Belt-and-suspenders: never carry a stale eviction label into a new claim
   // (should already be filtered out above).
@@ -661,6 +735,15 @@ async function checkCompletion() {
     return
   }
 
+  const ineligible = ineligibilityReason(snap)
+  if (ineligible) {
+    await evict(
+      pr,
+      `Checks path cannot finish merge: ${ineligible}. Re-add \`${READY_LABEL}\` only after this is fixed.`,
+    )
+    return
+  }
+
   if (snap.mergeStateStatus === 'BEHIND') {
     log(
       `PR #${pr} is BEHIND \`${TARGET_BRANCH}\` even though checks are finishing on the old head. Re-syncing instead of waiting on auto-merge that cannot succeed under strict status checks.`,
@@ -682,6 +765,7 @@ async function checkCompletion() {
   if (snap.headRefOid && snap.headRefOid !== sha) {
     log(`Head SHA for PR #${pr} moved ${sha.slice(0, 7)} -> ${snap.headRefOid.slice(0, 7)}; updating tracked SHA.`)
     setVar('MERGE_QUEUE_SHA', snap.headRefOid)
+    markProgress()
   }
 
   const checks = ghJsonAsDefaultToken(['pr', 'checks', pr, '--required', '--json', 'name,bucket'])
@@ -744,6 +828,7 @@ async function cleanup() {
     if (DRY_RUN) return
     const head = ghJson(['pr', 'view', EVENT_PR_NUMBER, '--json', 'headRefOid']).headRefOid
     setVar('MERGE_QUEUE_SHA', head)
+    markProgress()
     enableAutoMerge(EVENT_PR_NUMBER)
     log(`Now watching PR #${EVENT_PR_NUMBER} at ${head}.`)
     return
@@ -785,8 +870,8 @@ async function watchdog() {
   await maintainInFlight(pr)
 
   // maintainInFlight may have advanced the queue (evict/closed) or re-synced
-  // a BEHIND PR (which refreshes CLAIMED_AT). Re-read state before deciding
-  // on a hung-PR eviction.
+  // a BEHIND PR (which refreshes LAST_PROGRESS_AT only). Re-read state
+  // before deciding on a hung-PR eviction — wall-clock CLAIMED_AT is fixed.
   const stillPr = getVar('MERGE_QUEUE_PR')
   const stillClaimedAt = getVar('MERGE_QUEUE_CLAIMED_AT')
   if (!stillPr || !stillClaimedAt) {
@@ -794,13 +879,18 @@ async function watchdog() {
     return
   }
 
-  const elapsedMinutes = (Date.now() - new Date(stillClaimedAt).getTime()) / 60000
-  if (elapsedMinutes <= STALE_AFTER_MINUTES) {
+  const stillProgressAt = getVar('MERGE_QUEUE_LAST_PROGRESS_AT') || stillClaimedAt
+  const wallMinutes = (Date.now() - new Date(stillClaimedAt).getTime()) / 60000
+  const progressMinutes = (Date.now() - new Date(stillProgressAt).getTime()) / 60000
+  if (wallMinutes <= STALE_AFTER_MINUTES) {
     log(
-      `PR #${stillPr} has been in flight for ${Math.round(elapsedMinutes)}m, under the ${STALE_AFTER_MINUTES}m threshold (claim clock may have been refreshed by a re-sync).`,
+      `PR #${stillPr} wall=${Math.round(wallMinutes)}m progress=${Math.round(progressMinutes)}m under the ${STALE_AFTER_MINUTES}m wall-clock threshold.`,
     )
     return
   }
+
+  // Use wallMinutes for the rest of the stale path (was elapsedMinutes).
+  const elapsedMinutes = wallMinutes
 
   // Past the stale window and still claimed after maintainInFlight. Prefer
   // diagnosing over blind eviction of a healthy PR:
@@ -882,9 +972,13 @@ async function watchdog() {
     log(`Could not read required checks for stale PR #${stillPr}: ${String(err.message || err).split('\n')[0]}`)
   }
 
+  const why = ineligibilityReason(snap)
+  const detail = why
+    ? why
+    : `checks not failing, auto-merge did not complete, mergeStateStatus=${snap.mergeStateStatus}`
   await evict(
     stillPr,
-    `Stuck in the merge queue for over ${STALE_AFTER_MINUTES} minutes with no resolution (checks not failing, auto-merge did not complete, mergeStateStatus=${snap.mergeStateStatus}). Confirm branch protection / review requirements / deploy-lock, then re-add \`${READY_LABEL}\`.`,
+    `Stuck in the merge queue for over ${STALE_AFTER_MINUTES} minutes wall-clock (${Math.round(progressMinutes)}m since last progress). ${detail}. Confirm branch protection / review requirements / deploy-lock / unresolved conversations, then re-add \`${READY_LABEL}\`.`,
   )
 }
 
