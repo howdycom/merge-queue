@@ -526,6 +526,27 @@ async function maintainInFlight(prNumber, depth = 0) {
   }
 }
 
+
+// Required-check classification.
+//
+// `gh pr checks --required` buckets:
+//   pass | fail | pending | skipping | cancel
+//
+// CRITICAL: do NOT treat `cancel` as a hard failure. A cancelled required
+// check almost always means "superseded by a newer run" (update-branch,
+// author push, concurrency on the PR's CI workflows) — not "this PR is
+// broken." Treating cancel as fail previously caused healthy PRs to get
+// `requires action` mid-queue whenever CI was cancelled-and-restarted
+// while check-completion or the watchdog raced the new run. Cancel is
+// wait-and-retry, same family as pending.
+function isHardFailCheck(check) {
+  return check.bucket === 'fail'
+}
+
+function isWaitCheck(check) {
+  return check.bucket === 'pending' || check.bucket === 'cancel'
+}
+
 // ---- commands ----
 
 async function dequeue(depth = 0) {
@@ -563,7 +584,29 @@ async function dequeue(depth = 0) {
     return
   }
 
-  const withMeta = prs.map((pr) => ({
+  // A PR can end up with both `ready to merge` and `requires action` when a
+  // human re-adds ready without first clearing the eviction label. Those
+  // PRs are NOT ready candidates — they still need the underlying failure
+  // fixed. Without this filter, dequeue re-claims the same previously
+  // evicted PR (oldest readySince often wins) and re-blocks the queue.
+  const eligible = prs.filter((pr) => {
+    const names = (pr.labels || []).map((l) => l.name)
+    return !names.includes(REQUIRES_ACTION_LABEL)
+  })
+  const skipped = prs.length - eligible.length
+  if (skipped > 0) {
+    log(
+      `Skipping ${skipped} PR(s) that still have \`${REQUIRES_ACTION_LABEL}\` alongside \`${READY_LABEL}\`. Clear \`${REQUIRES_ACTION_LABEL}\` after fixing the issue, then re-add \`${READY_LABEL}\`.`,
+    )
+  }
+  if (eligible.length === 0) {
+    log(
+      `Queue has ${prs.length} ready-labeled PR(s) but none are eligible (all still marked \`${REQUIRES_ACTION_LABEL}\`). Nothing to dequeue.`,
+    )
+    return
+  }
+
+  const withMeta = eligible.map((pr) => ({
     ...pr,
     tier: classifyTier(pr),
     readySince: getReadySince(pr.number, pr.createdAt),
@@ -583,6 +626,9 @@ async function dequeue(depth = 0) {
   setVar('MERGE_QUEUE_SHA', 'pending')
   setVar('MERGE_QUEUE_CLAIMED_AT', new Date().toISOString())
   addLabel(next.number, PROCESSING_LABEL)
+  // Belt-and-suspenders: never carry a stale eviction label into a new claim
+  // (should already be filtered out above).
+  removeLabel(next.number, REQUIRES_ACTION_LABEL)
 
   await updateBranchAndWatch(next.number, depth)
 }
@@ -639,8 +685,25 @@ async function checkCompletion() {
   }
 
   const checks = ghJsonAsDefaultToken(['pr', 'checks', pr, '--required', '--json', 'name,bucket'])
-  const failing = checks.filter((c) => c.bucket === 'fail' || c.bucket === 'cancel')
+  const failing = checks.filter(isHardFailCheck)
+  const waiting = checks.filter(isWaitCheck)
   if (failing.length === 0) {
+    // Waiting (pending OR cancelled-and-likely-rerunning) is not green and
+    // is not a reason to evict. Re-arm auto-merge and let the next
+    // workflow_run / watchdog decide.
+    if (waiting.length > 0) {
+      const names = waiting.map((c) => `${c.name}(${c.bucket})`).join(', ')
+      log(
+        `PR #${pr} still has in-flight required check(s): ${names}. Not failing — leaving claim and waiting.`,
+      )
+      const autoMergeState = ghJson(['pr', 'view', pr, '--json', 'autoMergeRequest']).autoMergeRequest
+      if (!autoMergeState) {
+        log(`PR #${pr} has no active auto-merge request. Retrying enableAutoMerge while checks are still running.`)
+        enableAutoMerge(pr)
+      }
+      return
+    }
+
     // Enabling auto-merge at claim time (in dequeue) can silently fail if
     // GitHub requires branch-protection conditions to already be met at the
     // moment it's requested -- unconfirmed whether that applies to classic
@@ -766,7 +829,7 @@ async function watchdog() {
 
   try {
     const checks = ghJsonAsDefaultToken(['pr', 'checks', stillPr, '--required', '--json', 'name,bucket'])
-    const failing = checks.filter((c) => c.bucket === 'fail' || c.bucket === 'cancel')
+    const failing = checks.filter(isHardFailCheck)
     if (failing.length > 0) {
       const names = failing.map((c) => c.name).join(', ')
       await evict(
@@ -775,7 +838,9 @@ async function watchdog() {
       )
       return
     }
-    const pending = checks.filter((c) => c.bucket === 'pending')
+    // pending OR cancel: still not a terminal outcome. Soft-requeue so a
+    // slow/re-running required check can't starve the rest of the ready list.
+    const pending = checks.filter(isWaitCheck)
     if (pending.length > 0) {
       // CI is still running past the budget. Don't mark requires-action for
       // a healthy PR whose only crime is slow E2E -- release the claim so
@@ -789,8 +854,8 @@ async function watchdog() {
       // to "now", demoting it behind older ready PRs. That's the right
       // fairness behavior for a slow PR starving the queue.
       log(
-        `PR #${stillPr} still has pending required checks after ${Math.round(elapsedMinutes)}m: ${pending
-          .map((c) => c.name)
+        `PR #${stillPr} still has pending/cancelled required checks after ${Math.round(elapsedMinutes)}m: ${pending
+          .map((c) => `${c.name}(${c.bucket})`)
           .join(', ')}. Soft-requeueing (remove+re-add \`${READY_LABEL}\`) so older-ready peers aren't starved by a single slow PR.`,
       )
       // Clear claim BEFORE removing ready so the unlabeled webhook's cleanup
@@ -804,8 +869,8 @@ async function watchdog() {
       addLabel(stillPr, READY_LABEL)
       comment(
         stillPr,
-        `Soft-requeued by the merge-queue watchdog: still running required checks after ${Math.round(elapsedMinutes)} minutes (${pending
-          .map((c) => c.name)
+        `Soft-requeued by the merge-queue watchdog: still running (or cancelled-and-rerunning) required checks after ${Math.round(elapsedMinutes)} minutes (${pending
+          .map((c) => `${c.name}(${c.bucket})`)
           .join(
             ', ',
           )}). Left in the queue (still has \`${READY_LABEL}\`) but moved to the back of its priority tier so other ready PRs can proceed. No action needed unless checks ultimately fail.`,

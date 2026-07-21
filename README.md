@@ -46,9 +46,9 @@ on:
   schedule:
     # Watchdog + idle/BEHIND self-heal. One ubuntu-slim job; keep this
     # relatively frequent so a stranded in-flight PR recovers without a
-    # multi-hour wait. 30m is a good default; 3h is too slow when develop
+    # multi-hour wait. 15m is a good default (30m is acceptable); 3h is too slow when develop
     # advances outside the queue and the in-flight PR goes BEHIND.
-    - cron: '*/30 * * * *'
+    - cron: '*/15 * * * *'
 
 jobs:
   process:
@@ -72,7 +72,8 @@ A PR gets the `ready to merge` label once it's approved and green. From there it
 - **Re-sync when the base moves (critical)** — if a PR is already in flight and `target_branch` advances (manual merges, another path landing develop), branch protection with `required_status_checks.strict=true` makes native auto-merge **unable** to finish a `BEHIND` PR. On every subsequent `dequeue` trigger (including push to develop), the queue now **re-evaluates** the in-flight PR via `maintainInFlight`: re-`update-branch` when `mergeStateStatus=BEHIND`, clear and advance when closed/unlabeled, evict on real conflicts. Previously it logged "Already in flight. Nothing to do." and left healthy PRs stranded until the watchdog wrongly `requires action`'d them.
 - **`check-completion` also re-syncs BEHIND** — not only when required checks fail. If checks finish on an old head that is now behind the base, it re-updates instead of "leaving it to native auto-merge" forever.
 - **`synchronize` keeps the claim** — when the in-flight PR's head moves (our `update-branch` or an author push), cleanup refreshes `MERGE_QUEUE_SHA` and re-arms auto-merge. It does **not** clear the claim and re-dequeue (the old path double-claimed every successful update and raced check-completion).
-- **Eviction** (removes `ready to merge`, adds `requires action`, comments why) happens on: a real merge conflict (`mergeable=CONFLICTING`), a **required** check failing after the update, or a watchdog timeout where checks are green but merge still never completed (branch protection / review / deploy-lock investigation needed). Optional/advisory check failures do not evict.
+- **Eviction** (removes `ready to merge`, adds `requires action`, comments why) happens on: a real merge conflict (`mergeable=CONFLICTING`), a **required** check *failing* after the update, or a watchdog timeout where checks are green but merge still never completed (branch protection / review / deploy-lock investigation needed). Optional/advisory check failures do not evict. **Cancelled required checks are not failures** — they mean a run was superseded and are treated like `pending` (wait / soft-requeue), not `requires action`.
+- **`requires action` blocks re-entry** — a PR that still carries `requires action` is skipped even if someone also re-applied `ready to merge`. Clear the eviction label after fixing the underlying issue, then re-add `ready to merge`. Re-adding ready alone used to re-claim previously-evicted PRs and re-block the whole queue.
 - **Watchdog is smarter than blind eviction** — every schedule run re-evaluates the in-flight PR first (`maintainInFlight`). Past `stale_after_minutes`: failing required checks → evict with names; still-pending required checks → **soft-requeue** (remove+re-add `ready to merge` so `readySince` moves to now and peers aren't starved, without `requires action`); otherwise evict with a diagnostic message. Successful re-syncs refresh `MERGE_QUEUE_CLAIMED_AT` so a PR that keeps getting legitimately rebased isn't false-evicted mid-CI.
 - **No stuck queue** — clearing the in-flight PR for any reason immediately tries the next one. Retryable non-conflict `update-branch` failures release the claim without failing the Actions run (exit 0) so the Actions tab stays readable.
 
