@@ -116,9 +116,19 @@ jobs:
       # production ("Resource not accessible by integration
       # (node.statusCheckRollup.nodes.0)") after granting the four above
       # without it.
+      #
+      # actions is WRITE (not read) since the cancelled-check re-run fix:
+      # queue.mjs re-runs required checks that ended cancelled -- a job
+      # timeout reports as cancelled, and evicting on it threw healthy PRs
+      # out of the queue in production -- via `gh run rerun --failed`, which
+      # needs Actions write. The default token is used for this too (the
+      # fine-grained PAT would need an extra grant nobody else needs).
+      # Callers' job-level permissions cap this: they must grant
+      # `actions: write` or the re-run degrades to a logged warning (the
+      # attempt cap still evicts eventually, so it fails safe).
       checks: read
       statuses: read
-      actions: read
+      actions: write
       pull-requests: read
       contents: read
     steps:
@@ -159,6 +169,18 @@ jobs:
   watchdog:
     if: github.event_name == 'schedule'
     runs-on: ${{ inputs.runs_on }}
+    permissions:
+      # Same rationale as check-completion above: the watchdog reads required
+      # checks with the default GITHUB_TOKEN (fine-grained PATs can't read
+      # other Apps' check runs), and since the cancelled-check re-run fix it
+      # can also `gh run rerun --failed` a run whose job hit its timeout --
+      # hence actions: write. Previously this job declared no permissions and
+      # silently inherited whatever the caller granted; explicit is safer.
+      checks: read
+      statuses: read
+      actions: write
+      pull-requests: read
+      contents: read
     steps:
       - name: Maintain in-flight PR / soft-requeue / evict / idle dequeue
         uses: howdycom/workflows/actions/merge-queue@v1
