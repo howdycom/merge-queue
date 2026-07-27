@@ -12,6 +12,7 @@ from project_sync import (
     GitHubProjectsClient,
     ProjectContext,
     ProjectItem,
+    PrSyncInfo,
     SyncConfig,
     _parse_int_env,
     extract_pull_request_numbers_from_commit_subjects,
@@ -47,8 +48,10 @@ CONTEXT = ProjectContext(
 class RecordingClient:
     """Stand-in for GitHubProjectsClient used by the higher-level handlers."""
 
-    def __init__(self, items_by_pr=None, context=CONTEXT):
+    def __init__(self, items_by_pr=None, context=CONTEXT, meta_by_pr=None):
         self.items_by_pr = items_by_pr or {}
+        # pr_number -> (title, author_login); defaults to a non-skipped PR.
+        self.meta_by_pr = meta_by_pr or {}
         self.context = context
         self.updated = []
         self.resolved = 0
@@ -57,8 +60,11 @@ class RecordingClient:
         self.resolved += 1
         return self.context
 
-    def fetch_project_items_for_pr(self, pr_number, config):
-        return self.items_by_pr.get(pr_number, [])
+    def fetch_pr_sync_info(self, pr_number, config, project_id):
+        title, author = self.meta_by_pr.get(pr_number, ("feat: work", "dev"))
+        return PrSyncInfo(
+            title=title, author_login=author, items=self.items_by_pr.get(pr_number, [])
+        )
 
     def set_item_status(self, context, item_id, option_id):
         self.updated.append((item_id, option_id))
@@ -184,8 +190,13 @@ class BackwardGuardTests(unittest.TestCase):
 
 
 class CommitSubjectTests(unittest.TestCase):
-    def test_extracts_and_dedupes_pr_numbers(self):
-        subjects = ["feat: thing (#12)", "fix: other (#12)", "chore: last (#34)", "no ref here"]
+    def test_extracts_squash_and_merge_commit_pr_numbers(self):
+        subjects = [
+            "feat: thing (#12)",
+            "fix: other (#12)",  # dedupe
+            "Merge pull request #34 from howdycom/feat/x",  # merge-commit form
+            "no ref here",
+        ]
         self.assertEqual(extract_pull_request_numbers_from_commit_subjects(subjects), [12, 34])
 
     def test_reads_subjects_from_commit_range(self):
@@ -288,10 +299,12 @@ class GraphQLClientTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Could not resolve project"):
                 self._client().resolve_project(CONFIG)
 
-    def test_fetch_project_items_filters_and_parses(self):
+    def test_fetch_pr_sync_info_filters_by_project_id_and_parses(self):
         data = {
             "repository": {
                 "pullRequest": {
+                    "title": "feat: add",
+                    "author": {"login": "dev"},
                     "closingIssuesReferences": {
                         "nodes": [
                             None,  # non-dict issue node is skipped
@@ -302,12 +315,13 @@ class GraphQLClientTests(unittest.TestCase):
                                         "bad-node",  # non-dict item skipped
                                         {
                                             "id": "ITEM_A",
-                                            "project": {"number": 3},
+                                            "project": {"id": "PVT_1"},
                                             "fieldValueByName": {"name": "Todo"},
                                         },
                                         {
-                                            "id": "ITEM_OTHER",
-                                            "project": {"number": 99},
+                                            # same project number elsewhere, different id
+                                            "id": "ITEM_FOREIGN",
+                                            "project": {"id": "PVT_OTHER"},
                                             "fieldValueByName": {"name": "Todo"},
                                         },
                                     ]
@@ -319,26 +333,36 @@ class GraphQLClientTests(unittest.TestCase):
                                     "nodes": [
                                         {
                                             "id": "ITEM_B",
-                                            "project": {"number": 3},
+                                            "project": {"id": "PVT_1"},
                                             "fieldValueByName": None,
                                         }
                                     ]
                                 },
                             },
                         ]
-                    }
+                    },
                 }
             }
         }
         with patch.object(GitHubProjectsClient, "_graphql", return_value=data):
-            items = self._client().fetch_project_items_for_pr(100, CONFIG)
+            info = self._client().fetch_pr_sync_info(100, CONFIG, "PVT_1")
+        self.assertEqual(info.title, "feat: add")
+        self.assertEqual(info.author_login, "dev")
         self.assertEqual(
-            items,
+            info.items,
             [
                 ProjectItem(issue_number=100, item_id="ITEM_A", current_status="Todo"),
                 ProjectItem(issue_number=0, item_id="ITEM_B", current_status=None),
             ],
         )
+
+    def test_fetch_pr_sync_info_handles_missing_author(self):
+        data = {"repository": {"pullRequest": {"title": "t", "author": None}}}
+        with patch.object(GitHubProjectsClient, "_graphql", return_value=data):
+            info = self._client().fetch_pr_sync_info(1, CONFIG, "PVT_1")
+        self.assertEqual(info.title, "t")
+        self.assertIsNone(info.author_login)
+        self.assertEqual(info.items, [])
 
     def test_set_item_status_sends_mutation(self):
         captured = {}
@@ -398,6 +422,14 @@ class ProcessPrNumbersTests(unittest.TestCase):
         process_pr_numbers([1], "QA", CONFIG, CONTEXT, client)
         self.assertEqual(client.updated, [])
 
+    def test_skips_pr_matching_skip_rules(self):
+        items = [ProjectItem(issue_number=100, item_id="ITEM_A", current_status="Todo")]
+        client = RecordingClient(
+            items_by_pr={5: items}, meta_by_pr={5: ("Bump deps", "dependabot[bot]")}
+        )
+        process_pr_numbers([5], "Done", CONFIG, CONTEXT, client)
+        self.assertEqual(client.updated, [])
+
     def test_updates_items(self):
         items = [ProjectItem(issue_number=100, item_id="ITEM_A", current_status="Todo")]
         client = RecordingClient(items_by_pr={5: items})
@@ -423,8 +455,10 @@ class ProcessPrNumbersTests(unittest.TestCase):
 
 
 class ClientFactoryTests(unittest.TestCase):
-    def test_returns_none_without_token(self):
-        with patch.dict(os.environ, {"GITHUB_REPOSITORY": "a/b"}, clear=True):
+    def test_returns_none_without_projects_token_even_if_github_token_set(self):
+        # No GITHUB_TOKEN fallback: a missing PROJECTS_TOKEN must no-op.
+        env = {"GITHUB_TOKEN": "gtok", "GITHUB_REPOSITORY": "a/b"}
+        with patch.dict(os.environ, env, clear=True):
             self.assertIsNone(get_client_or_none())
 
     def test_returns_none_without_repository(self):
@@ -436,12 +470,6 @@ class ClientFactoryTests(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             client = get_client_or_none()
         self.assertEqual(client.token, "ptok")
-
-    def test_falls_back_to_github_token(self):
-        env = {"GITHUB_TOKEN": "gtok", "GITHUB_REPOSITORY": "a/b"}
-        with patch.dict(os.environ, env, clear=True):
-            client = get_client_or_none()
-        self.assertEqual(client.token, "gtok")
 
 
 class ReadEventPayloadTests(unittest.TestCase):
@@ -594,7 +622,7 @@ class ScriptEntryPointTests(unittest.TestCase):
         )
 
     def test_exits_zero_when_no_client(self):
-        result = self._run({"PROJECTS_TOKEN": "", "GITHUB_TOKEN": "", "GITHUB_REPOSITORY": ""})
+        result = self._run({"PROJECTS_TOKEN": "", "GITHUB_REPOSITORY": ""})
         self.assertEqual(result.returncode, 0)
         self.assertIn("skipping project sync", result.stdout)
 

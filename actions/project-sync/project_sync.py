@@ -17,6 +17,13 @@ issue linked to the PR via GitHub's native "Closes #N" / "Fixes #N" mechanism
 Column names, board owner/number, and the base/production branches are all
 configured via environment variables so the same script drives any repo's board.
 
+PROJECTS_TOKEN must be able to BOTH read the repository's pull requests/issues
+(the ``closingIssuesReferences`` lookup is a repo-level GraphQL read, which needs
+repo PR/issue read access on a private repo) AND write organization Projects.
+A fine-grained PAT with "Pull requests: read" on the repo + "Projects: read and
+write" on the org, or a GitHub App installation token with the same, satisfies
+both. The default GITHUB_TOKEN cannot write Projects and is not used.
+
 Backward-move guard: unlike a locked-down Jira workflow (which only offers the
 transitions valid from the current status), the Projects API allows any status
 to move to any other. To avoid dragging an already-advanced issue backwards when
@@ -48,7 +55,9 @@ DEFAULT_PROJECT_NUMBER = 3
 DEFAULT_STATUS_FIELD = "Status"
 DEFAULT_PR_BASE_BRANCH = "staging"
 DEFAULT_PRODUCTION_BRANCH = "main"
-PULL_REQUEST_NUMBER_REGEX = r"\(#(\d+)\)"
+# Matches both the squash-merge subject "Title (#123)" and the merge-commit
+# subject "Merge pull request #123 from ...".
+PULL_REQUEST_NUMBER_REGEX = r"\(#(\d+)\)|Merge pull request #(\d+)"
 
 
 @dataclass(frozen=True)
@@ -90,6 +99,15 @@ class ProjectItem:
     issue_number: int
     item_id: str
     current_status: str | None
+
+
+@dataclass(frozen=True)
+class PrSyncInfo:
+    """A PR's title/author (for skip rules) plus its linked board items."""
+
+    title: str | None
+    author_login: str | None
+    items: list[ProjectItem]
 
 
 def _parse_int_env(name: str, default: int) -> int:
@@ -179,7 +197,7 @@ def extract_pull_request_numbers_from_commit_subjects(subjects: Sequence[str]) -
     seen: set[int] = set()
     for subject in subjects:
         for match in re.finditer(PULL_REQUEST_NUMBER_REGEX, subject):
-            number = int(match.group(1))
+            number = int(match.group(1) or match.group(2))
             if number not in seen:
                 seen.add(number)
                 numbers.append(number)
@@ -254,19 +272,21 @@ class GitHubProjectsClient:
         }
         return ProjectContext(project_id=project_id, field_id=field_id, option_ids=option_ids)
 
-    def fetch_project_items_for_pr(self, pr_number: int, config: SyncConfig) -> list[ProjectItem]:
+    def fetch_pr_sync_info(self, pr_number: int, config: SyncConfig, project_id: str) -> PrSyncInfo:
         owner, _, repo = self.repository.partition("/")
         query = """
         query($owner: String!, $repo: String!, $number: Int!, $field: String!) {
           repository(owner: $owner, name: $repo) {
             pullRequest(number: $number) {
+              title
+              author { login }
               closingIssuesReferences(first: 20) {
                 nodes {
                   number
                   projectItems(first: 20) {
                     nodes {
                       id
-                      project { number }
+                      project { id }
                       fieldValueByName(name: $field) {
                         ... on ProjectV2ItemFieldSingleSelectValue { name }
                       }
@@ -289,6 +309,8 @@ class GitHubProjectsClient:
         )
         repository = data.get("repository") or {}
         pull_request = repository.get("pullRequest") or {}
+        title = pull_request.get("title")
+        author_login = (pull_request.get("author") or {}).get("login")
         references = (pull_request.get("closingIssuesReferences") or {}).get("nodes") or []
 
         items: list[ProjectItem] = []
@@ -300,7 +322,9 @@ class GitHubProjectsClient:
                 if not isinstance(node, dict):
                     continue
                 project = node.get("project") or {}
-                if project.get("number") != config.project_number:
+                # Compare by the resolved project node id, not the number: project
+                # numbers are scoped per owner, so a foreign project can share #3.
+                if project.get("id") != project_id:
                     continue
                 status_value = node.get("fieldValueByName") or {}
                 items.append(
@@ -310,7 +334,7 @@ class GitHubProjectsClient:
                         current_status=status_value.get("name"),
                     )
                 )
-        return items
+        return PrSyncInfo(title=title, author_login=author_login, items=items)
 
     def set_item_status(self, context: ProjectContext, item_id: str, option_id: str) -> None:
         mutation = """
@@ -401,11 +425,16 @@ def process_pr_numbers(
     failures = 0
     total = 0
     for pr_number in pr_numbers:
-        items = client.fetch_project_items_for_pr(pr_number, config)
-        if not items:
+        info = client.fetch_pr_sync_info(pr_number, config, context.project_id)
+        # Apply skip rules on every path (incl. production pushes), so dependabot/
+        # Revert/Bump/[TECH] PRs never move their linked board items.
+        if should_skip_pr(info.title, info.author_login):
+            print(f"  PR #{pr_number}: {info.title!r} is TECH/Revert/Bump/dependabot; skipping")
+            continue
+        if not info.items:
             print(f"  PR #{pr_number}: no linked board issue; skipping")
             continue
-        for item in items:
+        for item in info.items:
             total += 1
             label = f"#{item.issue_number} (PR #{pr_number})"
             try:
@@ -420,10 +449,13 @@ def process_pr_numbers(
 
 
 def get_client_or_none() -> GitHubProjectsClient | None:
-    token = os.environ.get("PROJECTS_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    # Only PROJECTS_TOKEN: no GITHUB_TOKEN fallback. The default token cannot
+    # write org Projects, so falling back would turn a missing-secret no-op into
+    # a hard auth failure. An empty/absent PROJECTS_TOKEN must no-op.
+    token = os.environ.get("PROJECTS_TOKEN")
     repository = os.environ.get("GITHUB_REPOSITORY")
     if not token or not repository:
-        print("PROJECTS_TOKEN/GITHUB_TOKEN or GITHUB_REPOSITORY is not set; skipping project sync")
+        print("PROJECTS_TOKEN or GITHUB_REPOSITORY is not set; skipping project sync")
         return None
     return GitHubProjectsClient(token=token, repository=repository)
 
