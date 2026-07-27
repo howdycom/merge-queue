@@ -27,6 +27,7 @@ Reference actions and workflows by tag, not by branch:
 | [`actions/claude-remediation-prepare`](actions/claude-remediation-prepare) | Validates a `/claude-fix` trigger comment, checks commenter permission and branch/build-tooling safety, and gathers PR context (metadata, diff, comments) for a Claude remediation run. Runs on plain `node`, no repo toolchain needed. |
 | [`actions/open-remediation-pr`](actions/open-remediation-pr) | Commits working-tree changes as `github-actions[bot]`, pushes a new branch, and opens a draft PR against a given base branch. |
 | [`actions/merge-queue`](actions/merge-queue) | One state-machine step (`dequeue` / `check-completion` / `cleanup` / `watchdog`) of the merge-queue simulator — see below. |
+| [`actions/project-sync`](actions/project-sync) | Reproduces a Jira-style PR/push → board status automation on a native GitHub Project (v2). Moves the Status field of the board issues linked to a PR (`Closes #N`) as it progresses; board owner/number and column names are inputs. |
 
 ## Available reusable workflows
 
