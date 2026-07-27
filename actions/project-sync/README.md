@@ -29,9 +29,15 @@ back to an earlier column is skipped. The `in_progress ↔ review` oscillation
 
 ## Requirements
 
-A **`token`** with read/write access to organization Projects — a fine-grained
-PAT or a GitHub App installation token. The default `GITHUB_TOKEN` **cannot**
-write Projects v2.
+A **`token`** — a fine-grained PAT or GitHub App installation token — that has
+**both**:
+
+- repository **Pull requests: read** (and issues read) — the closing-issues
+  lookup is a repo-level GraphQL read, required on a private repo; and
+- organization **Projects: read and write**.
+
+The default `GITHUB_TOKEN` **cannot** write Projects v2, so it is not usable
+here and the action does not fall back to it.
 
 ## Usage
 
