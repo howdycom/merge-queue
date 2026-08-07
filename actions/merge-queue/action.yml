@@ -54,9 +54,10 @@ inputs:
     description: >
       For the watchdog command: wall-clock minutes since FIRST claim
       (MERGE_QUEUE_CLAIMED_AT). Past this budget: failing required checks
-      evict; pending/cancelled required checks soft-requeue; otherwise
-      diagnostic eviction. Successful BEHIND re-syncs update progress only
-      and do not reset this budget.
+      evict; cancelled checks get bounded re-runs; pending checks
+      soft-requeue; otherwise diagnostic eviction. Successful BEHIND
+      re-syncs and check re-runs update progress only and do not reset this
+      budget.
     required: false
     default: '90'
   event_pr_number:
@@ -74,6 +75,11 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+
     - name: Run merge-queue command
       shell: bash
       env:

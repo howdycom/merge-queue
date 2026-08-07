@@ -8,21 +8,30 @@
 //   MERGE_QUEUE_PR              - PR number currently in flight, or unset if idle
 //   MERGE_QUEUE_SHA             - head SHA we're watching checks for ("pending"
 //                                 between claiming a PR and update-branch settling)
-//   MERGE_QUEUE_CLAIMED_AT      - ISO8601 timestamp of FIRST claim only (wall-clock
-//                                 hang budget for the watchdog). Never refreshed
-//                                 on BEHIND re-sync — refreshing it previously
-//                                 immortalized stuck claims whenever develop
-//                                 advanced (astro-market #3875: 3h+ wall clock
-//                                 while watchdog always logged "under 90m").
-//   MERGE_QUEUE_LAST_PROGRESS_AT - ISO8601 of last successful update-branch /
-//                                 head SHA progress. Updated on re-sync so logs
-//                                 can show "still making progress" without
-//                                 resetting the hang budget.
+//   MERGE_QUEUE_CLAIMED_AT      - ISO8601 timestamp of the first claim. This is
+//                                 the watchdog's wall-clock hang budget and is
+//                                 never refreshed while the claim stays active.
+//   MERGE_QUEUE_LAST_PROGRESS_AT - ISO8601 timestamp of the latest successful
+//                                 update-branch, head change, or check re-run.
 //   MERGE_QUEUE_UPDATE_FAIL_PR/
 //   MERGE_QUEUE_UPDATE_FAIL_COUNT - consecutive non-conflict update-branch
 //                                 failures for a specific PR, used only to
 //                                 evict after MAX_UPDATE_BRANCH_RETRIES
 //                                 instead of retrying the same PR forever
+//   MERGE_QUEUE_RERUN_PR/
+//   MERGE_QUEUE_RERUN_COUNT     - re-run attempts for cancelled (not failed)
+//                                 required checks on a specific PR, capped at
+//                                 MAX_CHECK_RERUN_ATTEMPTS before eviction.
+//                                 Deliberately NOT cleared while the same PR
+//                                 stays in flight (clearing on a green/pending
+//                                 pass would let a chronically timing-out job
+//                                 alternate cancel -> re-run forever without
+//                                 ever hitting the cap); reset only when
+//                                 dequeue makes a fresh claim, so a PR that
+//                                 was evicted with spent budget and later
+//                                 re-queued by a human starts over instead of
+//                                 being insta-evicted on its first transient
+//                                 cancellation.
 import { execFileSync } from 'node:child_process'
 
 const REPO = requireEnv('GITHUB_REPOSITORY')
@@ -42,10 +51,6 @@ const STALE_AFTER_MINUTES = Number(process.env.MQ_STALE_AFTER_MINUTES || '90')
 const EVENT_PR_NUMBER = process.env.MQ_EVENT_PR_NUMBER || ''
 const EVENT_ACTION = process.env.MQ_EVENT_ACTION || ''
 const DRY_RUN = process.env.MQ_DRY_RUN === 'true'
-// When true (default), only PRs with reviewDecision=APPROVED may enter or
-// stay in the queue. Set MQ_REQUIRE_APPROVED=false only for repos that do
-// not use required reviews on the target branch.
-const REQUIRE_APPROVED = process.env.MQ_REQUIRE_APPROVED !== 'false'
 const UPDATE_BRANCH_POLL_ATTEMPTS = 12
 const UPDATE_BRANCH_POLL_INTERVAL_MS = 5000
 // Short poll for GitHub's mergeable computation to settle out of UNKNOWN
@@ -71,6 +76,19 @@ const MAX_DEQUEUE_RECURSION_DEPTH = 20
 // rather than an immediate eviction. See MERGE_QUEUE_UPDATE_FAIL_PR /
 // MERGE_QUEUE_UPDATE_FAIL_COUNT below.
 const MAX_UPDATE_BRANCH_RETRIES = 3
+// How many times cancelled (NOT failed) required checks get re-run for the
+// same in-flight PR before eviction. Cancelled is not a verdict on the code:
+// GitHub reports a job that blew its `timeout-minutes` as cancelled, and
+// concurrency-group supersession cancels too. Production evidence
+// (howdycom/astro-market, 2026-07-21): two healthy PRs (#3875, #3789) were
+// evicted for "Required check(s) failed: Prettier Format Check" when the
+// check's own format step had PASSED -- the job's post-run cache-save step
+// pushed a slow dependency install past a 10-minute job timeout, so the run
+// ended cancelled and the old fail|cancel bucket filter called that a
+// failure. The cap exists because a job that times out every single run
+// (a genuinely broken/overloaded job) should surface to a human, not re-run
+// forever.
+const MAX_CHECK_RERUN_ATTEMPTS = 2
 // Regex matching the two phrasings GitHub returns when update-branch is a
 // no-op because the head is already current with the base.
 const ALREADY_UP_TO_DATE_RE = /up.to.date|not.*behind|no new commits on the base branch/i
@@ -181,6 +199,10 @@ function clearQueueState() {
   deleteVar('MERGE_QUEUE_LAST_PROGRESS_AT')
 }
 
+function markProgress() {
+  setVar('MERGE_QUEUE_LAST_PROGRESS_AT', new Date().toISOString())
+}
+
 // ---- PR mutations ----
 
 function addLabel(prNumber, label) {
@@ -244,45 +266,6 @@ function viewPr(prNumber) {
   ])
 }
 
-/**
- * Returns null if the PR is eligible for the merge queue, or a short human
- * reason if it is not. Used both pre-claim (dequeue filter) and in-flight
- * (immediate eviction when a claim becomes unmergeable).
- *
- * Production failure this closes: ready-labeled PRs with outstanding
- * CHANGES_REQUESTED (astro-market #3875) were claimed and held the single-
- * flight slot for hours because native auto-merge can never finish them
- * under required-review branch protection.
- */
-function ineligibilityReason(pr) {
-  if (pr.isDraft) return 'PR is still a draft'
-  const names = (pr.labels || []).map((l) => l.name)
-  if (names.includes(REQUIRES_ACTION_LABEL)) {
-    return `still has \`${REQUIRES_ACTION_LABEL}\` (clear it after fixing the issue, then re-add \`${READY_LABEL}\`)`
-  }
-  if (REQUIRE_APPROVED) {
-    const rd = pr.reviewDecision || ''
-    if (rd === 'CHANGES_REQUESTED') {
-      return 'reviewDecision=CHANGES_REQUESTED (outstanding changes-requested review blocks merge)'
-    }
-    if (rd === 'REVIEW_REQUIRED') {
-      return 'reviewDecision=REVIEW_REQUIRED (approvals / code owners not satisfied)'
-    }
-    if (rd !== 'APPROVED') {
-      return `reviewDecision=${rd || '(empty)'} (APPROVED required to enter the queue; set MQ_REQUIRE_APPROVED=false only if the target branch does not require reviews)`
-    }
-  }
-  return null
-}
-
-function isEligibleReadyPr(pr) {
-  return ineligibilityReason(pr) === null
-}
-
-function markProgress() {
-  setVar('MERGE_QUEUE_LAST_PROGRESS_AT', new Date().toISOString())
-}
-
 async function resolveMergeable(prNumber, initialMergeable) {
   let mergeable = initialMergeable
   for (let attempt = 0; mergeable === 'UNKNOWN' && attempt < MERGEABLE_POLL_ATTEMPTS; attempt++) {
@@ -307,8 +290,157 @@ async function evict(prNumber, reason, depth = 0) {
     // guarantees a fresh dequeue gets triggered by an eviction specifically
     // (a conflict, a failed check, or a watchdog timeout isn't a push or a
     // labeled event itself). Without this, any other ready PR would sit
-    // stalled until an unrelated event happened to fire.
-    await dequeue(depth + 1)
+    // stalled until an unrelated event happened to fire. Pass the evicted
+    // PR as the exclusion: `gh pr list` reads the search index, which lags
+    // the label removal above by a few seconds -- in production (2026-07-21
+    // 15:04Z) this chained dequeue re-selected and re-claimed the very PR
+    // it had evicted two seconds earlier, wasting a full check cycle until
+    // a second eviction advanced the queue for real.
+    await dequeue(depth + 1, String(prNumber))
+  }
+}
+
+/**
+ * Release the claim and move a still-viable PR to the back of its priority
+ * tier. readySince is derived from the ready label's most recent "labeled"
+ * timeline event (see getReadySince), so removing and re-adding the label
+ * is exactly what demotes it within its tier. Used instead of evict() when
+ * the PR is not at fault (slow checks, an approval that disappeared) -- it
+ * keeps the ready label so no human has to re-queue it.
+ */
+async function softRequeueToBack(prNumber, body, depth = 0) {
+  // Clear the claim BEFORE removing the ready label so the unlabeled
+  // webhook's cleanup job sees no matching MERGE_QUEUE_PR and no-ops
+  // (avoids a double-dequeue race with the explicit dequeue() below).
+  removeLabel(prNumber, PROCESSING_LABEL)
+  clearQueueState()
+  removeLabel(prNumber, READY_LABEL)
+  // Re-add ready so it stays in the queue, but with a fresh readySince
+  // (end of the line within its tier). Guarded: if the re-add fails after
+  // the remove succeeded, the PR would otherwise silently leave the queue
+  // with no label, no comment, and only a red Actions run as evidence.
+  try {
+    addLabel(prNumber, READY_LABEL)
+  } catch (err) {
+    log(
+      `Warning: could not re-add "${READY_LABEL}" to PR #${prNumber} during soft-requeue: ${String(err.message || err).split('\n')[0]}. The PR is OUT of the queue until a human re-adds the label.`,
+    )
+  }
+  comment(prNumber, body)
+  // Exclude the just-requeued PR from the immediate re-pick: it moved to
+  // the back of its tier by definition, and the search index may not have
+  // caught up with the label churn yet anyway.
+  await dequeue(depth + 1, String(prNumber))
+}
+
+/**
+ * Required check(s) ended "cancelled" -- usually a job that blew its
+ * `timeout-minutes` budget (GitHub reports that as conclusion=cancelled) or
+ * a concurrency-group supersession, NOT a verdict on the code. See
+ * MAX_CHECK_RERUN_ATTEMPTS for the production incident this fixes. Re-run
+ * the cancelled workflow runs in place (same head SHA, so MERGE_QUEUE_SHA
+ * stays valid and their completion re-triggers check-completion), bounded
+ * per PR so a chronically timing-out job still surfaces to a human.
+ *
+ * The re-run call uses the job's default GITHUB_TOKEN (ghAsDefaultToken),
+ * not the PAT: fine-grained PATs would need an Actions write grant nobody
+ * else needs, while the default token just needs the calling job to declare
+ * `actions: write`. If that permission is missing the call fails safe --
+ * logged warning, claim kept, attempt still counted -- and the cap
+ * eventually evicts with an accurate reason instead of looping forever.
+ */
+async function rerunCancelledChecks(prNumber, cancelled) {
+  const names = cancelled.map((c) => c.name).join(', ')
+
+  // `gh pr checks --json link` returns the check's HTML URL, which embeds
+  // the workflow run id (/actions/runs/<id>/...) for Actions-backed checks;
+  // job-level links (/actions/runs/<id>/job/<jobId>) match the same prefix.
+  // Plain commit statuses (e.g. deploy-lock) have non-Actions links and
+  // filter out -- they also can never be CANCELLED (the status API has no
+  // such state), so in practice this branch is defensive only. Several
+  // checks can share one run; dedupe before re-running.
+  const runIds = [...new Set(cancelled.map((c) => ((c.link || '').match(/\/actions\/runs\/(\d+)/) || [])[1]).filter(Boolean))]
+  if (runIds.length === 0) {
+    log(
+      `Cancelled required check(s) on PR #${prNumber} (${names}), but no workflow run id could be resolved from their links (plain commit status?). Leaving the claim in place -- the watchdog will re-check and eventually evict.`,
+    )
+    return
+  }
+
+  // Only re-run runs that are actually completed. A run that is queued or
+  // in_progress here almost always means a previous pass already requested
+  // the re-run seconds ago and the check rollup hasn't flipped back to
+  // pending yet -- several cancelled workflows firing their completion
+  // events back-to-back serialize through the concurrency group, and
+  // without this gate each trailing pass would burn one attempt on a
+  // rerun-failed-jobs call GitHub is guaranteed to reject ("run in
+  // progress"). Passes that start nothing do not count toward the cap.
+  const completedRunIds = []
+  for (const runId of runIds) {
+    try {
+      const status = ghJsonAsDefaultToken(['api', `repos/${REPO}/actions/runs/${runId}`]).status
+      if (status === 'completed') {
+        completedRunIds.push(runId)
+      } else {
+        log(`Run ${runId} is ${status} -- a re-run is already underway. Not counting an attempt; waiting for it to finish.`)
+      }
+    } catch (err) {
+      log(`Warning: could not read status of run ${runId}: ${String(err.stderr || err.message || err).split('\n')[0]}. Skipping it this pass.`)
+    }
+  }
+  if (completedRunIds.length === 0) return
+
+  const lastRerunPr = getVar('MERGE_QUEUE_RERUN_PR')
+  const priorRaw = Number(getVar('MERGE_QUEUE_RERUN_COUNT') || '0')
+  // Number.isFinite guards a hand-edited/corrupted variable: NaN compares
+  // false against the cap and would otherwise disable it entirely.
+  const priorAttempts = lastRerunPr === String(prNumber) && Number.isFinite(priorRaw) ? priorRaw : 0
+  const attempts = priorAttempts + 1
+
+  if (attempts > MAX_CHECK_RERUN_ATTEMPTS) {
+    await evict(
+      prNumber,
+      `Required check(s) keep ending cancelled -- not failed -- despite ${MAX_CHECK_RERUN_ATTEMPTS} re-run attempt(s): ${names}. A cancelled check usually means the job hit its \`timeout-minutes\` budget (GitHub reports timeouts as cancelled) or a concurrency group cancelled it. Check the job's timeout and the workflow's concurrency settings, then re-add \`${READY_LABEL}\`.`,
+    )
+    // Deleted after evict() so a failed eviction preserves the spent budget
+    // (dequeue also resets these on every fresh claim).
+    deleteVar('MERGE_QUEUE_RERUN_PR')
+    deleteVar('MERGE_QUEUE_RERUN_COUNT')
+    return
+  }
+
+  setVar('MERGE_QUEUE_RERUN_PR', String(prNumber))
+  setVar('MERGE_QUEUE_RERUN_COUNT', String(attempts))
+
+  let started = 0
+  for (const runId of completedRunIds) {
+    logAction(`re-run cancelled workflow run ${runId} for PR #${prNumber} (attempt ${attempts}/${MAX_CHECK_RERUN_ATTEMPTS}: ${names})`)
+    if (DRY_RUN) continue
+    try {
+      // --failed re-runs failed and cancelled jobs only, keeping green jobs'
+      // results -- cheaper and faster than re-running the whole run.
+      ghAsDefaultToken(['run', 'rerun', runId, '--failed'])
+      started++
+    } catch (err) {
+      log(
+        `Warning: could not re-run workflow run ${runId}: ${String(err.stderr || err.message || err).split('\n')[0]}. If this is "Resource not accessible", the calling job needs \`actions: write\` for its default GITHUB_TOKEN (see the README). The attempt still counts toward the cap, so this cannot loop forever.`,
+      )
+    }
+  }
+
+  if (started > 0 || DRY_RUN) {
+    // A re-run is real progress, but it must not reset the wall-clock claim
+    // budget. Otherwise repeated cancellations can keep one claim alive
+    // indefinitely while every re-run restarts the watchdog timer.
+    markProgress()
+  } else {
+    // Nothing actually restarted (permissions, 30-day retention limit, ...).
+    // Deliberately do NOT record progress: with no new run there
+    // will be no workflow_run event, so recovery is watchdog-driven -- a
+    // refreshed progress timestamp would make the diagnostic misleading.
+    log(
+      `No re-run could be started for PR #${prNumber} (attempt ${attempts}/${MAX_CHECK_RERUN_ATTEMPTS} still counts). Progress timestamp NOT refreshed; the watchdog's wall-clock window governs recovery.`,
+    )
   }
 }
 
@@ -479,11 +611,9 @@ async function updateBranchAndWatch(prNumber, depth = 0) {
     )
   }
 
-  // Progress only. Wall-clock CLAIMED_AT stays fixed so a permanently
-  // unmergeable PR that keeps getting rebased by external base-branch
-  // advances cannot immortalize its hang timer. Healthy mid-CI PRs that
-  // still have pending required checks are soft-requeued past the wall
-  // budget (not hard-evicted), so legitimate re-syncs are safe.
+  // Record progress without resetting the wall-clock claim budget. Resetting
+  // CLAIMED_AT here previously made a stuck PR immortal whenever the base
+  // branch kept advancing and triggering successful re-syncs.
   setVar('MERGE_QUEUE_SHA', newSha)
   markProgress()
   log(`Now watching PR #${prNumber} at ${newSha}.`)
@@ -514,7 +644,7 @@ async function maintainInFlight(prNumber, depth = 0) {
       `Could not load in-flight PR #${prNumber} (${String(err.message || err).split('\n')[0]}). Clearing claim so the queue can advance.`,
     )
     clearQueueState()
-    await dequeue(depth + 1)
+    await dequeue(depth + 1, String(prNumber))
     return
   }
 
@@ -522,7 +652,7 @@ async function maintainInFlight(prNumber, depth = 0) {
     log(`In-flight PR #${prNumber} is ${snap.state}. Clearing claim and advancing the queue.`)
     removeLabel(prNumber, PROCESSING_LABEL)
     clearQueueState()
-    await dequeue(depth + 1)
+    await dequeue(depth + 1, String(prNumber))
     return
   }
 
@@ -531,17 +661,45 @@ async function maintainInFlight(prNumber, depth = 0) {
     log(`In-flight PR #${prNumber} no longer has \`${READY_LABEL}\`. Clearing claim and advancing the queue.`)
     removeLabel(prNumber, PROCESSING_LABEL)
     clearQueueState()
-    await dequeue(depth + 1)
+    await dequeue(depth + 1, String(prNumber))
     return
   }
 
-  // Immediate eviction for unmergeable claims (review / dual-label / draft).
-  // Do not wait for the wall-clock budget — auto-merge can never finish these.
-  const ineligible = ineligibilityReason(snap)
-  if (ineligible) {
+  // Draft guard, same reasoning as the review-state guard below: dequeue
+  // filters drafts at claim time, but an author can convert the in-flight
+  // PR to draft afterwards, and native auto-merge can never complete a
+  // draft. Soft-requeue rather than evict -- draft is a deliberate,
+  // reversible "not yet" from the author, not a failure.
+  if (snap.isDraft) {
+    await softRequeueToBack(
+      prNumber,
+      `Soft-requeued by the merge queue: this PR was converted to draft while in flight, and native auto-merge cannot complete a draft PR. It keeps \`${READY_LABEL}\` and becomes eligible again when marked ready for review.`,
+      depth,
+    )
+    return
+  }
+
+  // Review-state guard. dequeue() filters these out at claim time now, but
+  // the state can also change *after* the claim: a reviewer can request
+  // changes mid-flight, or an approval can be dismissed. mergeStateStatus
+  // BLOCKED alone cannot distinguish "waiting for checks" (fine, native
+  // auto-merge will finish) from "unmergeable review state" (auto-merge
+  // waits forever) -- in production (howdycom/astro-market 2026-07-21) a
+  // CHANGES_REQUESTED PR (#3614) was claimed at 15:08Z and every subsequent
+  // pass logged "still valid ... Leaving it to native auto-merge" while the
+  // whole queue sat head-of-line blocked behind it for hours.
+  if (snap.reviewDecision === 'CHANGES_REQUESTED') {
     await evict(
       prNumber,
-      `In-flight PR is not mergeable via auto-merge: ${ineligible}. Re-add \`${READY_LABEL}\` only after this is fixed.`,
+      `A reviewer has requested changes (reviewDecision=CHANGES_REQUESTED), so native auto-merge can never complete this PR. Address the review (or have it dismissed), then re-add \`${READY_LABEL}\`.`,
+      depth,
+    )
+    return
+  }
+  if (snap.reviewDecision === 'REVIEW_REQUIRED') {
+    await softRequeueToBack(
+      prNumber,
+      `Soft-requeued by the merge queue: this PR needs an approving review it does not currently have (reviewDecision=REVIEW_REQUIRED), so native auto-merge cannot complete it. It keeps \`${READY_LABEL}\` and re-enters at the back of its priority tier; it becomes eligible again once approved.`,
       depth,
     )
     return
@@ -593,30 +751,9 @@ async function maintainInFlight(prNumber, depth = 0) {
   }
 }
 
-
-// Required-check classification.
-//
-// `gh pr checks --required` buckets:
-//   pass | fail | pending | skipping | cancel
-//
-// CRITICAL: do NOT treat `cancel` as a hard failure. A cancelled required
-// check almost always means "superseded by a newer run" (update-branch,
-// author push, concurrency on the PR's CI workflows) — not "this PR is
-// broken." Treating cancel as fail previously caused healthy PRs to get
-// `requires action` mid-queue whenever CI was cancelled-and-restarted
-// while check-completion or the watchdog raced the new run. Cancel is
-// wait-and-retry, same family as pending.
-function isHardFailCheck(check) {
-  return check.bucket === 'fail'
-}
-
-function isWaitCheck(check) {
-  return check.bucket === 'pending' || check.bucket === 'cancel'
-}
-
 // ---- commands ----
 
-async function dequeue(depth = 0) {
+async function dequeue(depth = 0, excludePr = '') {
   if (depth > MAX_DEQUEUE_RECURSION_DEPTH) {
     log(
       `Reached the max recursion depth (${MAX_DEQUEUE_RECURSION_DEPTH}) of dequeue<->evict calls in a single run -- stopping here rather than risking a runaway loop. Whatever's left in the queue will be picked up by the next real trigger (push, label, or the watchdog).`,
@@ -626,6 +763,15 @@ async function dequeue(depth = 0) {
 
   const inFlight = getVar('MERGE_QUEUE_PR')
   if (inFlight) {
+    // In dry-run, evictions/requeues don't actually clear the claim, so a
+    // chained re-entry would re-evaluate the identical state up to the
+    // recursion cap, logging the same would-evict block ~20 times per run.
+    // Depth 0 still evaluates normally, so shadow mode shows the decision
+    // exactly once.
+    if (DRY_RUN && depth > 0) {
+      log(`[dry-run] claim on PR #${inFlight} would have been released by the previous step; stopping re-entry here.`)
+      return
+    }
     // Previously this returned immediately ("Nothing to do"), which is what
     // stranded healthy BEHIND PRs whenever develop advanced while they were
     // claimed. Always re-evaluate the in-flight PR instead.
@@ -643,42 +789,30 @@ async function dequeue(depth = 0) {
     TARGET_BRANCH,
     '--label',
     READY_LABEL,
+    // Explicit: gh defaults to 30, which silently truncates the candidate
+    // set -- the astro-market ready list has been observed at 21+ PRs, and
+    // a truncated page could hide an older tier-1/HOTFIX PR entirely.
+    '--limit',
+    '100',
     '--json',
-    'number,title,labels,createdAt,reviewDecision,isDraft',
+    'number,title,labels,createdAt,isDraft,reviewDecision',
   ])
-  if (prs.length === 0) {
-    log('Queue is empty.')
-    return
-  }
-
-  // Eligibility is broader than the ready label alone:
-  //  - still has `requires action` (human re-added ready without clearing eviction)
-  //  - draft
-  //  - reviewDecision not APPROVED (when MQ_REQUIRE_APPROVED, default true)
-  // Without this, dequeue claims PRs native auto-merge can never finish
-  // (e.g. CHANGES_REQUESTED) and blocks the entire single-flight queue.
-  const eligible = []
-  let skipped = 0
-  for (const pr of prs) {
-    const why = ineligibilityReason(pr)
-    if (why) {
-      skipped += 1
-      log(`Skipping PR #${pr.number}: ${why}`)
-      continue
-    }
-    eligible.push(pr)
-  }
-  if (skipped > 0) {
-    log(`Skipped ${skipped} ready-labeled PR(s) that are not eligible for the queue.`)
-  }
-  if (eligible.length === 0) {
+  // excludePr is the PR a caller just evicted, requeued, or watched close.
+  // `gh pr list` reads GitHub's search index, which lags label/state
+  // mutations by a few seconds -- in production (2026-07-21 15:04Z) an
+  // eviction's chained dequeue re-selected the very PR it had evicted two
+  // seconds earlier because the index still returned it.
+  const candidates = prs.filter((pr) => String(pr.number) !== String(excludePr))
+  if (candidates.length === 0) {
     log(
-      `Queue has ${prs.length} ready-labeled PR(s) but none are eligible. Nothing to dequeue.`,
+      prs.length > 0
+        ? `Queue is empty apart from just-released PR #${excludePr} (excluded this pass; the search index lags label changes).`
+        : 'Queue is empty.',
     )
     return
   }
 
-  const withMeta = eligible.map((pr) => ({
+  const withMeta = candidates.map((pr) => ({
     ...pr,
     tier: classifyTier(pr),
     readySince: getReadySince(pr.number, pr.createdAt),
@@ -689,22 +823,64 @@ async function dequeue(depth = 0) {
     return new Date(a.readySince) - new Date(b.readySince)
   })
 
-  const next = withMeta[0]
-  log(`Dequeuing PR #${next.number} "${next.title}" (tier ${next.tier}, ready since ${next.readySince})`)
+  // Walk candidates in priority order and claim the first one native
+  // auto-merge could actually complete. Drafts and PRs whose review state
+  // blocks merging must not be claimed: auto-merge silently waits forever
+  // on them, and claiming one head-of-line blocks the entire queue until
+  // the watchdog's stale timer fires. Production evidence (2026-07-21):
+  // dequeue claimed #3614 -- ready-labeled but CHANGES_REQUESTED since
+  // 07-14 -- and the queue merged nothing for the next several hours.
+  for (const next of withMeta) {
+    if (next.isDraft) {
+      log(
+        `Skipping PR #${next.number} "${next.title}": still a draft. It stays queued and becomes eligible when marked ready for review.`,
+      )
+      continue
+    }
+    if (next.reviewDecision === 'CHANGES_REQUESTED') {
+      // Unlike REVIEW_REQUIRED there is nothing pending about this state --
+      // only a human can resolve it (address the review or dismiss it), so
+      // evict with a comment rather than skipping silently: the author
+      // needs to know the ready label is doing nothing.
+      await evict(
+        next.number,
+        `A reviewer has requested changes (reviewDecision=CHANGES_REQUESTED), so native auto-merge can never complete this PR. Address the review (or have it dismissed), then re-add \`${READY_LABEL}\`.`,
+        depth,
+      )
+      continue
+    }
+    if (next.reviewDecision === 'REVIEW_REQUIRED') {
+      log(
+        `Skipping PR #${next.number} "${next.title}": reviewDecision=REVIEW_REQUIRED (the base branch requires an approving review this PR does not have yet). It stays queued and becomes eligible once approved.`,
+      )
+      continue
+    }
 
-  // Claim BEFORE calling update-branch so a crash mid-call is visible as
-  // "stuck in flight" (catchable by the watchdog) rather than invisible.
-  setVar('MERGE_QUEUE_PR', String(next.number))
-  setVar('MERGE_QUEUE_SHA', 'pending')
-  const claimedAt = new Date().toISOString()
-  setVar('MERGE_QUEUE_CLAIMED_AT', claimedAt) // wall-clock first claim — never refresh on re-sync
-  setVar('MERGE_QUEUE_LAST_PROGRESS_AT', claimedAt)
-  addLabel(next.number, PROCESSING_LABEL)
-  // Belt-and-suspenders: never carry a stale eviction label into a new claim
-  // (should already be filtered out above).
-  removeLabel(next.number, REQUIRES_ACTION_LABEL)
+    log(`Dequeuing PR #${next.number} "${next.title}" (tier ${next.tier}, ready since ${next.readySince})`)
 
-  await updateBranchAndWatch(next.number, depth)
+    // Claim BEFORE calling update-branch so a crash mid-call is visible as
+    // "stuck in flight" (catchable by the watchdog) rather than invisible.
+    const claimedAt = new Date().toISOString()
+    setVar('MERGE_QUEUE_PR', String(next.number))
+    setVar('MERGE_QUEUE_SHA', 'pending')
+    setVar('MERGE_QUEUE_CLAIMED_AT', claimedAt)
+    setVar('MERGE_QUEUE_LAST_PROGRESS_AT', claimedAt)
+    // A fresh claim starts a fresh cancelled-check re-run budget -- the
+    // counters deliberately survive everything within a flight (see header),
+    // so this claim-time reset is the ONLY thing that stops an
+    // evicted-then-requeued PR from inheriting spent budget and getting
+    // insta-evicted on its first transient cancellation.
+    deleteVar('MERGE_QUEUE_RERUN_PR')
+    deleteVar('MERGE_QUEUE_RERUN_COUNT')
+    addLabel(next.number, PROCESSING_LABEL)
+
+    await updateBranchAndWatch(next.number, depth)
+    return
+  }
+
+  log(
+    `No eligible PRs: every ready-labeled PR targeting ${TARGET_BRANCH} is a draft or blocked on review. Queue stays idle until one becomes eligible (approval, un-draft) -- the schedule tick or the next push/label event will pick it up.`,
+  )
 }
 
 async function checkCompletion() {
@@ -731,15 +907,34 @@ async function checkCompletion() {
     log(`PR #${pr} is ${snap.state}. Clearing claim and advancing the queue.`)
     removeLabel(pr, PROCESSING_LABEL)
     clearQueueState()
-    await dequeue()
+    await dequeue(0, String(pr))
     return
   }
 
-  const ineligible = ineligibilityReason(snap)
-  if (ineligible) {
+  // Same draft guard as maintainInFlight: auto-merge cannot complete a
+  // draft, and there is no point watching checks on one.
+  if (snap.isDraft) {
+    await softRequeueToBack(
+      pr,
+      `Soft-requeued by the merge queue: this PR was converted to draft while in flight, and native auto-merge cannot complete a draft PR. It keeps \`${READY_LABEL}\` and becomes eligible again when marked ready for review.`,
+    )
+    return
+  }
+
+  // Same review-state guard as maintainInFlight: BLOCKED cannot distinguish
+  // "waiting for checks" from "unmergeable review state", and there is no
+  // point re-syncing or watching checks on a PR auto-merge can never finish.
+  if (snap.reviewDecision === 'CHANGES_REQUESTED') {
     await evict(
       pr,
-      `Checks path cannot finish merge: ${ineligible}. Re-add \`${READY_LABEL}\` only after this is fixed.`,
+      `A reviewer has requested changes (reviewDecision=CHANGES_REQUESTED), so native auto-merge can never complete this PR. Address the review (or have it dismissed), then re-add \`${READY_LABEL}\`.`,
+    )
+    return
+  }
+  if (snap.reviewDecision === 'REVIEW_REQUIRED') {
+    await softRequeueToBack(
+      pr,
+      `Soft-requeued by the merge queue: this PR needs an approving review it does not currently have (reviewDecision=REVIEW_REQUIRED), so native auto-merge cannot complete it. It keeps \`${READY_LABEL}\` and re-enters at the back of its priority tier; it becomes eligible again once approved.`,
     )
     return
   }
@@ -768,26 +963,46 @@ async function checkCompletion() {
     markProgress()
   }
 
-  const checks = ghJsonAsDefaultToken(['pr', 'checks', pr, '--required', '--json', 'name,bucket'])
-  const failing = checks.filter(isHardFailCheck)
-  const waiting = checks.filter(isWaitCheck)
-  if (failing.length === 0) {
-    // Waiting (pending OR cancelled-and-likely-rerunning) is not green and
-    // is not a reason to evict. Re-arm auto-merge and let the next
-    // workflow_run / watchdog decide.
-    if (waiting.length > 0) {
-      const names = waiting.map((c) => `${c.name}(${c.bucket})`).join(', ')
+  let checks
+  try {
+    checks = ghJsonAsDefaultToken(['pr', 'checks', pr, '--required', '--json', 'name,bucket,link'])
+  } catch (err) {
+    // Transient API failure (or gh's "no checks reported" error, which
+    // exits 1 even with --json). Keep the claim and stay green -- the next
+    // completion event or watchdog tick re-reads; a red run here just
+    // drowns out real failures in the Actions tab (same rationale as the
+    // watchdog's identical guard).
+    log(
+      `Could not read required checks for PR #${pr}: ${String(err.stderr || err.message || err).split('\n')[0]}. Leaving the claim for a later pass.`,
+    )
+    return
+  }
+  // 'fail' only -- cancelled is handled separately below, because it is not
+  // a verdict on the code (job timeouts and concurrency supersessions both
+  // report as cancelled) and used to wrongly evict healthy PRs here. Note
+  // gh buckets a TIMED_OUT conclusion as 'fail', not 'cancel' -- that case
+  // (the check logic itself timing out, rather than the job wrapper being
+  // cancelled) still evicts, which is the right call for a check that ran
+  // and could not finish.
+  const failing = checks.filter((c) => c.bucket === 'fail')
+  const cancelled = checks.filter((c) => c.bucket === 'cancel')
+  const stillPending = checks.filter((c) => c.bucket === 'pending')
+  if (failing.length === 0 && cancelled.length > 0) {
+    if (stillPending.length > 0) {
+      // The check set has not settled: a sibling required check is still
+      // executing, so its completion event is guaranteed to re-enter here.
+      // Acting now would try to re-run a run GitHub may still consider in
+      // progress and double-count the attempt budget for what is really
+      // one cancellation episode.
       log(
-        `PR #${pr} still has in-flight required check(s): ${names}. Not failing — leaving claim and waiting.`,
+        `Required check(s) ended cancelled on PR #${pr} (${cancelled.map((c) => c.name).join(', ')}) but ${stillPending.length} required check(s) are still pending. Waiting for the set to settle.`,
       )
-      const autoMergeState = ghJson(['pr', 'view', pr, '--json', 'autoMergeRequest']).autoMergeRequest
-      if (!autoMergeState) {
-        log(`PR #${pr} has no active auto-merge request. Retrying enableAutoMerge while checks are still running.`)
-        enableAutoMerge(pr)
-      }
       return
     }
-
+    await rerunCancelledChecks(pr, cancelled)
+    return
+  }
+  if (failing.length === 0) {
     // Enabling auto-merge at claim time (in dequeue) can silently fail if
     // GitHub requires branch-protection conditions to already be met at the
     // moment it's requested -- unconfirmed whether that applies to classic
@@ -845,8 +1060,10 @@ async function cleanup() {
   // gets triggered -- an unlabeled/close on the in-flight PR isn't a push
   // or a labeled event itself. Without this, a still-ready PR elsewhere in
   // the queue would sit stalled until some unrelated event happened to fire.
-  // Pick up the next one immediately instead.
-  await dequeue()
+  // Pick up the next one immediately instead (excluding the PR that just
+  // closed/unlabeled -- the search index may still return it for a few
+  // seconds).
+  await dequeue(0, String(EVENT_PR_NUMBER))
 }
 
 async function watchdog() {
@@ -870,8 +1087,8 @@ async function watchdog() {
   await maintainInFlight(pr)
 
   // maintainInFlight may have advanced the queue (evict/closed) or re-synced
-  // a BEHIND PR (which refreshes LAST_PROGRESS_AT only). Re-read state
-  // before deciding on a hung-PR eviction — wall-clock CLAIMED_AT is fixed.
+  // a BEHIND PR (which refreshes LAST_PROGRESS_AT only). Re-read state before
+  // deciding on a hung-PR eviction; CLAIMED_AT remains the first-claim time.
   const stillPr = getVar('MERGE_QUEUE_PR')
   const stillClaimedAt = getVar('MERGE_QUEUE_CLAIMED_AT')
   if (!stillPr || !stillClaimedAt) {
@@ -884,12 +1101,11 @@ async function watchdog() {
   const progressMinutes = (Date.now() - new Date(stillProgressAt).getTime()) / 60000
   if (wallMinutes <= STALE_AFTER_MINUTES) {
     log(
-      `PR #${stillPr} wall=${Math.round(wallMinutes)}m progress=${Math.round(progressMinutes)}m under the ${STALE_AFTER_MINUTES}m wall-clock threshold.`,
+      `PR #${stillPr} wall=${Math.round(wallMinutes)}m progress=${Math.round(progressMinutes)}m, under the ${STALE_AFTER_MINUTES}m wall-clock threshold.`,
     )
     return
   }
 
-  // Use wallMinutes for the rest of the stale path (was elapsedMinutes).
   const elapsedMinutes = wallMinutes
 
   // Past the stale window and still claimed after maintainInFlight. Prefer
@@ -905,7 +1121,7 @@ async function watchdog() {
   } catch (err) {
     log(`Could not load stale PR #${stillPr}: ${String(err.message || err).split('\n')[0]}. Evicting claim.`)
     clearQueueState()
-    await dequeue()
+    await dequeue(0, String(stillPr))
     return
   }
 
@@ -913,13 +1129,15 @@ async function watchdog() {
     log(`Stale in-flight PR #${stillPr} is ${snap.state}. Clearing and advancing.`)
     removeLabel(stillPr, PROCESSING_LABEL)
     clearQueueState()
-    await dequeue()
+    await dequeue(0, String(stillPr))
     return
   }
 
   try {
-    const checks = ghJsonAsDefaultToken(['pr', 'checks', stillPr, '--required', '--json', 'name,bucket'])
-    const failing = checks.filter(isHardFailCheck)
+    const checks = ghJsonAsDefaultToken(['pr', 'checks', stillPr, '--required', '--json', 'name,bucket,link'])
+    // 'fail' only -- cancelled gets the bounded re-run treatment below, not
+    // an eviction (job timeouts report as cancelled; see check-completion).
+    const failing = checks.filter((c) => c.bucket === 'fail')
     if (failing.length > 0) {
       const names = failing.map((c) => c.name).join(', ')
       await evict(
@@ -928,9 +1146,20 @@ async function watchdog() {
       )
       return
     }
-    // pending OR cancel: still not a terminal outcome. Soft-requeue so a
-    // slow/re-running required check can't starve the rest of the ready list.
-    const pending = checks.filter(isWaitCheck)
+    const pending = checks.filter((c) => c.bucket === 'pending')
+    const cancelled = checks.filter((c) => c.bucket === 'cancel')
+    // Only re-run once the set has settled (no pending) -- a cancel+pending
+    // mix falls through to the pending soft-requeue below, same as any
+    // still-running set; the next settle re-evaluates the cancellation.
+    if (cancelled.length > 0 && pending.length === 0) {
+      log(
+        `PR #${stillPr} has cancelled (not failed) required check(s) after ${Math.round(elapsedMinutes)}m: ${cancelled
+          .map((c) => c.name)
+          .join(', ')}. Attempting a bounded re-run instead of evicting.`,
+      )
+      await rerunCancelledChecks(stillPr, cancelled)
+      return
+    }
     if (pending.length > 0) {
       // CI is still running past the budget. Don't mark requires-action for
       // a healthy PR whose only crime is slow E2E -- release the claim so
@@ -944,41 +1173,27 @@ async function watchdog() {
       // to "now", demoting it behind older ready PRs. That's the right
       // fairness behavior for a slow PR starving the queue.
       log(
-        `PR #${stillPr} still has pending/cancelled required checks after ${Math.round(elapsedMinutes)}m: ${pending
-          .map((c) => `${c.name}(${c.bucket})`)
+        `PR #${stillPr} still has pending required checks after ${Math.round(elapsedMinutes)}m: ${pending
+          .map((c) => c.name)
           .join(', ')}. Soft-requeueing (remove+re-add \`${READY_LABEL}\`) so older-ready peers aren't starved by a single slow PR.`,
       )
-      // Clear claim BEFORE removing ready so the unlabeled webhook's cleanup
-      // job sees no matching MERGE_QUEUE_PR and no-ops (avoids a double
-      // dequeue race with the explicit dequeue() below).
-      removeLabel(stillPr, PROCESSING_LABEL)
-      clearQueueState()
-      removeLabel(stillPr, READY_LABEL)
-      // Re-add ready so it stays in the queue, but with a fresh readySince
-      // (end of the line within its tier).
-      addLabel(stillPr, READY_LABEL)
-      comment(
+      await softRequeueToBack(
         stillPr,
-        `Soft-requeued by the merge-queue watchdog: still running (or cancelled-and-rerunning) required checks after ${Math.round(elapsedMinutes)} minutes (${pending
-          .map((c) => `${c.name}(${c.bucket})`)
+        `Soft-requeued by the merge-queue watchdog: still running required checks after ${Math.round(elapsedMinutes)} minutes (${pending
+          .map((c) => c.name)
           .join(
             ', ',
           )}). Left in the queue (still has \`${READY_LABEL}\`) but moved to the back of its priority tier so other ready PRs can proceed. No action needed unless checks ultimately fail.`,
       )
-      await dequeue()
       return
     }
   } catch (err) {
     log(`Could not read required checks for stale PR #${stillPr}: ${String(err.message || err).split('\n')[0]}`)
   }
 
-  const why = ineligibilityReason(snap)
-  const detail = why
-    ? why
-    : `checks not failing, auto-merge did not complete, mergeStateStatus=${snap.mergeStateStatus}`
   await evict(
     stillPr,
-    `Stuck in the merge queue for over ${STALE_AFTER_MINUTES} minutes wall-clock (${Math.round(progressMinutes)}m since last progress). ${detail}. Confirm branch protection / review requirements / deploy-lock / unresolved conversations, then re-add \`${READY_LABEL}\`.`,
+    `Stuck in the merge queue for over ${STALE_AFTER_MINUTES} minutes wall-clock (${Math.round(progressMinutes)}m since last progress; checks not failing, auto-merge did not complete, mergeStateStatus=${snap.mergeStateStatus}, reviewDecision=${snap.reviewDecision || 'none'}). Confirm branch protection / review requirements / deploy-lock, then re-add \`${READY_LABEL}\`.`,
   )
 }
 
