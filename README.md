@@ -94,6 +94,8 @@ A PR gets the `ready to merge` label once it's approved and green. From there it
 | `workflow_run` `completed` | `check-completion` | Only if `workflow_run.head_sha == MERGE_QUEUE_SHA` — every other firing is skipped before a runner is allocated (free). On match: fail → evict; cancelled → bounded re-run; BEHIND → re-sync; review blocks merge → evict/soft-requeue; else ensure auto-merge |
 | `schedule` | `watchdog` | Always evaluates: maintain in-flight / soft-requeue / evict / idle dequeue |
 
+> **Caller-side event filters (cross-repo coupling).** Consumers may add a job-level `if:` on the *caller* workflow (before `uses: howdycom/workflows/...`) so non-queue-affecting events never enter the reusable workflow at all — e.g. astro-market skips draft `pull_request`s and only forwards `synchronize`/`closed` when the PR is the current `MERGE_QUEUE_PR` claim ([astro-market `.github/workflows/merge-queue.yml`](https://github.com/howdycom/astro-market/blob/develop/.github/workflows/merge-queue.yml)). That filter drops events *before this reusable workflow runs*, so the table above only sees what the caller lets through. If you change a job `if:` here **or** a consumer pre-filter, keep both sides aligned: a mismatch fails silently (queue stops reacting; no Actions error). Document any consumer pre-filter next to its `if:` with a pointer back to this section.
+
 **Label lifecycle:**
 
 | Label | Added by | Removed by |
