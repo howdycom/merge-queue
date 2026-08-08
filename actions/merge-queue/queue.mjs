@@ -132,9 +132,61 @@ function ghJsonAsDefaultToken(args) {
   return JSON.parse(ghAsDefaultToken(args))
 }
 
+// Fetch every page of a GitHub REST *list* endpoint as one flat array.
+// Prefer `gh api --paginate --slurp` when available (gh CLI >= ~2.48, 2024-04).
+// Self-hosted light runners may ship older `gh` that rejects `--slurp`
+// ("unknown flag: --slurp"), which previously crashed every dequeue/watchdog
+// call into getReadySince. Fall back to explicit page= iteration so the queue
+// keeps working on those fleets without requiring a runner image upgrade.
+let cachedGhApiSupportsSlurp
+function ghApiSupportsSlurp() {
+  if (cachedGhApiSupportsSlurp !== undefined) return cachedGhApiSupportsSlurp
+  try {
+    cachedGhApiSupportsSlurp = /\b--slurp\b/.test(sh(['gh', 'api', '--help']))
+  } catch {
+    cachedGhApiSupportsSlurp = false
+  }
+  return cachedGhApiSupportsSlurp
+}
+
+function appendQueryParam(endpoint, key, value) {
+  // Drop any existing occurrence of the key so page= can be set cleanly.
+  const withoutKey = endpoint
+    .replace(new RegExp(`([?&])${key}=[^&]*&?`), '$1')
+    .replace(/[?&]$/, '')
+  const sep = withoutKey.includes('?') ? '&' : '?'
+  return `${withoutKey}${sep}${key}=${encodeURIComponent(value)}`
+}
+
+function getQueryParam(endpoint, key) {
+  const match = endpoint.match(new RegExp(`[?&]${key}=([^&]*)`))
+  return match ? decodeURIComponent(match[1]) : null
+}
+
 function ghPaginatedJson(endpoint) {
-  const pages = ghJson(['api', '--paginate', '--slurp', endpoint])
-  return pages.flat()
+  if (ghApiSupportsSlurp()) {
+    const pages = ghJson(['api', '--paginate', '--slurp', endpoint])
+    return Array.isArray(pages) ? pages.flat() : pages
+  }
+
+  const perPage = Number(getQueryParam(endpoint, 'per_page')) || 100
+  let base = getQueryParam(endpoint, 'per_page')
+    ? endpoint
+    : appendQueryParam(endpoint, 'per_page', String(perPage))
+  // page= is owned by the loop below
+  base = base
+    .replace(new RegExp(`([?&])page=[^&]*&?`), '$1')
+    .replace(/[?&]$/, '')
+
+  const items = []
+  const maxPages = 100
+  for (let page = 1; page <= maxPages; page += 1) {
+    const batch = ghJson(['api', appendQueryParam(base, 'page', String(page))])
+    if (!Array.isArray(batch)) return batch
+    items.push(...batch)
+    if (batch.length < perPage) break
+  }
+  return items
 }
 
 function sleep(ms) {
