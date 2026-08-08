@@ -74,6 +74,104 @@ runs:
       with:
         node-version: '22'
 
+    # Self-hosted light runners may ship a years-old `gh` that lacks fields
+    # queue.mjs depends on (e.g. headRefOid, added in gh 2.18; --slurp ~2.48).
+    # Install the latest GitHub CLI release into the job workspace and put it
+    # first on PATH so every later step (and queue.mjs) uses that binary.
+    # No root/sudo: tarball unpacks under $RUNNER_TEMP.
+    - name: Ensure latest GitHub CLI
+      shell: bash
+      env:
+        # Unauthenticated rate limit is fine; use job token when present for reliability.
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+
+        current_version() {
+          if ! command -v gh >/dev/null 2>&1; then
+            echo 'none'
+            return
+          fi
+          # "gh version 2.40.1 (2024-...)" → 2.40.1
+          gh --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo 'none'
+        }
+
+        version_ge() {
+          # version_ge A B → 0 if A >= B (semver major.minor.patch)
+          printf '%s\n%s\n' "$1" "$2" | sort -V | head -1 | grep -qx "$2"
+        }
+
+        # Floor for fields queue.mjs uses today (headRefOid, autoMergeRequest, etc.).
+        # We still prefer latest; this is only the "already good enough" short-circuit
+        # when offline install is impossible.
+        MIN_GH_VERSION='2.48.0'
+
+        BEFORE="$(current_version)"
+        echo "Runner gh before: ${BEFORE} ($(command -v gh 2>/dev/null || echo 'not on PATH'))"
+
+        OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+        case "$(uname -m)" in
+          x86_64|amd64) ARCH=amd64 ;;
+          aarch64|arm64) ARCH=arm64 ;;
+          *)
+            echo "::error::Unsupported architecture for gh install: $(uname -m)"
+            exit 1
+            ;;
+        esac
+
+        case "$OS" in
+          linux)  OS_LABEL=linux ;;
+          darwin) OS_LABEL=macOS ;;
+          *)
+            echo "::error::Unsupported OS for gh install: $OS"
+            exit 1
+            ;;
+        esac
+
+        # Resolve latest stable tag (vX.Y.Z). Prefer gh itself when present; fall back to REST.
+        if command -v gh >/dev/null 2>&1; then
+          LATEST_TAG="$(gh api repos/cli/cli/releases/latest --jq .tag_name)"
+        else
+          LATEST_TAG="$(curl -fsSL https://api.github.com/repos/cli/cli/releases/latest | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
+        fi
+        if [[ -z "${LATEST_TAG}" || "${LATEST_TAG}" == null ]]; then
+          echo "::error::Could not resolve latest cli/cli release tag"
+          exit 1
+        fi
+        LATEST_VERSION="${LATEST_TAG#v}"
+        echo "Latest gh release: ${LATEST_TAG}"
+
+        if [[ "$BEFORE" != 'none' ]] && version_ge "$BEFORE" "$LATEST_VERSION"; then
+          echo "gh ${BEFORE} is already latest; leaving PATH unchanged."
+          gh --version
+          exit 0
+        fi
+
+        ASSET="gh_${LATEST_VERSION}_${OS_LABEL}_${ARCH}.tar.gz"
+        URL="https://github.com/cli/cli/releases/download/${LATEST_TAG}/${ASSET}"
+        DEST="${RUNNER_TEMP:-/tmp}/gh-latest"
+        mkdir -p "$DEST"
+        echo "Downloading ${URL}"
+        curl -fsSL "$URL" -o "${DEST}/${ASSET}"
+        tar -xzf "${DEST}/${ASSET}" -C "$DEST"
+        BIN_DIR="${DEST}/gh_${LATEST_VERSION}_${OS_LABEL}_${ARCH}/bin"
+        if [[ ! -x "${BIN_DIR}/gh" ]]; then
+          echo "::error::Extracted gh binary missing at ${BIN_DIR}/gh"
+          exit 1
+        fi
+
+        echo "${BIN_DIR}" >> "$GITHUB_PATH"
+        export PATH="${BIN_DIR}:${PATH}"
+
+        AFTER="$(current_version)"
+        echo "Runner gh after: ${AFTER} ($(command -v gh))"
+        gh --version
+
+        if [[ "$AFTER" == 'none' ]] || ! version_ge "$AFTER" "$MIN_GH_VERSION"; then
+          echo "::error::gh after install is ${AFTER}; need >= ${MIN_GH_VERSION}"
+          exit 1
+        fi
+
     - name: Run merge-queue command
       shell: bash
       env:
