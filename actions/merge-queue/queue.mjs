@@ -109,6 +109,28 @@ function ghJson(args) {
   return JSON.parse(gh(args))
 }
 
+// POST/PATCH/etc. with a JSON body via `gh api --input -`. Prefer this over
+// `gh pr edit` for mutations that only need REST (labels especially):
+// `gh pr edit` still GraphQL-loads classic Projects `projectCards`, which
+// GitHub now rejects and aborts the command on.
+// Production evidence (howdycom/astro-market self-hosted merge-queue
+// watchdog, 2026-08-08): dequeue claimed PR #6677 then died on
+// `gh pr edit … --add-label merge-queue: processing` with
+//   GraphQL: Projects (classic) is being deprecated … (projectCards)
+// leaving MERGE_QUEUE_* variables set and the processing label never applied.
+function ghApiJson(method, endpoint, body) {
+  return execFileSync(
+    'gh',
+    ['api', '-X', method, endpoint, '--input', '-'],
+    {
+      encoding: 'utf-8',
+      input: JSON.stringify(body),
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: process.env,
+    },
+  ).trim()
+}
+
 // Fine-grained PATs can't read check-run results (as opposed to legacy
 // commit statuses) created by other Apps via GraphQL, no matter what
 // repository permission is granted -- confirmed the hard way when
@@ -252,14 +274,24 @@ function clearQueueState() {
 function addLabel(prNumber, label) {
   logAction(`add label "${label}" to PR #${prNumber}`)
   if (DRY_RUN) return
-  gh(['pr', 'edit', String(prNumber), '--add-label', label])
+  // Issues REST, not `gh pr edit --add-label` — see ghApiJson comment.
+  // PR numbers are issue numbers for the labels endpoints.
+  ghApiJson('POST', `repos/${REPO}/issues/${prNumber}/labels`, { labels: [label] })
 }
 
 function removeLabel(prNumber, label) {
   logAction(`remove label "${label}" from PR #${prNumber}`)
   if (DRY_RUN) return
   try {
-    gh(['pr', 'edit', String(prNumber), '--remove-label', label])
+    // DELETE /repos/{owner}/{repo}/issues/{issue_number}/labels/{name}
+    // Label names with spaces/colons (e.g. "merge-queue: processing") must
+    // be path-encoded. Same classic-Projects GraphQL pitfall as addLabel.
+    gh([
+      'api',
+      '-X',
+      'DELETE',
+      `repos/${REPO}/issues/${prNumber}/labels/${encodeURIComponent(label)}`,
+    ])
   } catch (err) {
     // Mirrors getVar's 404-vs-other distinction. NOT independently verified
     // against a real "label already absent" case (couldn't safely force
