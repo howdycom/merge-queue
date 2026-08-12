@@ -76,9 +76,10 @@ runs:
 
     # Self-hosted light runners may ship a years-old `gh` that lacks fields
     # queue.mjs depends on (e.g. headRefOid, added in gh 2.18; --slurp ~2.48).
-    # Install the latest GitHub CLI release into the job workspace and put it
-    # first on PATH so every later step (and queue.mjs) uses that binary.
-    # No root/sudo: tarball unpacks under $RUNNER_TEMP.
+    # Prefer the latest GitHub CLI release, but a brand-new cli/cli tag (or a
+    # transient GitHub Releases 503) must not fail the queue — retry, then
+    # walk back through recent stables and install the first tarball that
+    # downloads. No root/sudo: tarball unpacks under $RUNNER_TEMP.
     - name: Ensure latest GitHub CLI
       shell: bash
       env:
@@ -102,8 +103,8 @@ runs:
         }
 
         # Floor for fields queue.mjs uses today (headRefOid, autoMergeRequest, etc.).
-        # We still prefer latest; this is only the "already good enough" short-circuit
-        # when offline install is impossible.
+        # We still prefer latest; this is the "already good enough" bar when the
+        # GitHub Releases CDN will not serve a newer tarball.
         MIN_GH_VERSION='2.48.0'
 
         BEFORE="$(current_version)"
@@ -130,47 +131,95 @@ runs:
 
         # Resolve latest stable tag (vX.Y.Z). Prefer gh itself when present; fall back to REST.
         if command -v gh >/dev/null 2>&1; then
-          LATEST_TAG="$(gh api repos/cli/cli/releases/latest --jq .tag_name)"
+          LATEST_TAG="$(gh api repos/cli/cli/releases/latest --jq .tag_name || true)"
         else
-          LATEST_TAG="$(curl -fsSL https://api.github.com/repos/cli/cli/releases/latest | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
+          LATEST_TAG="$(curl -fsSL --retry 3 --retry-delay 2 https://api.github.com/repos/cli/cli/releases/latest | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1 || true)"
         fi
         if [[ -z "${LATEST_TAG}" || "${LATEST_TAG}" == null ]]; then
-          echo "::error::Could not resolve latest cli/cli release tag"
-          exit 1
+          echo "Could not resolve latest cli/cli release tag; will try the recent-release list."
+          LATEST_TAG=''
+          LATEST_VERSION=''
+        else
+          LATEST_VERSION="${LATEST_TAG#v}"
+          echo "Latest gh release: ${LATEST_TAG}"
         fi
-        LATEST_VERSION="${LATEST_TAG#v}"
-        echo "Latest gh release: ${LATEST_TAG}"
 
-        if [[ "$BEFORE" != 'none' ]] && version_ge "$BEFORE" "$LATEST_VERSION"; then
+        if [[ -n "$LATEST_VERSION" && "$BEFORE" != 'none' ]] && version_ge "$BEFORE" "$LATEST_VERSION"; then
           echo "gh ${BEFORE} is already latest; leaving PATH unchanged."
           gh --version
           exit 0
         fi
 
-        ASSET="gh_${LATEST_VERSION}_${OS_LABEL}_${ARCH}.tar.gz"
-        URL="https://github.com/cli/cli/releases/download/${LATEST_TAG}/${ASSET}"
-        DEST="${RUNNER_TEMP:-/tmp}/gh-latest"
-        mkdir -p "$DEST"
-        echo "Downloading ${URL}"
-        curl -fsSL "$URL" -o "${DEST}/${ASSET}"
-        tar -xzf "${DEST}/${ASSET}" -C "$DEST"
-        BIN_DIR="${DEST}/gh_${LATEST_VERSION}_${OS_LABEL}_${ARCH}/bin"
-        if [[ ! -x "${BIN_DIR}/gh" ]]; then
-          echo "::error::Extracted gh binary missing at ${BIN_DIR}/gh"
-          exit 1
-        fi
+        download_and_install() {
+          local tag="$1"
+          local version="${tag#v}"
+          local asset="gh_${version}_${OS_LABEL}_${ARCH}.tar.gz"
+          local url="https://github.com/cli/cli/releases/download/${tag}/${asset}"
+          local dest="${RUNNER_TEMP:-/tmp}/gh-install"
+          rm -rf "$dest"
+          mkdir -p "$dest"
+          echo "Downloading ${url}"
+          # --retry already covers HTTP 503. Do not use --retry-all-errors:
+          # older runner curl (7.68 on Ubuntu 20.04) does not have that flag.
+          if ! curl -fL --retry 5 --retry-delay 2 --connect-timeout 15 \
+              -o "${dest}/${asset}" "$url"; then
+            echo "Download failed for ${tag}; will try an older release if available."
+            return 1
+          fi
+          if ! tar -xzf "${dest}/${asset}" -C "$dest"; then
+            echo "Extract failed for ${tag}; will try an older release if available."
+            return 1
+          fi
+          local bin_dir="${dest}/gh_${version}_${OS_LABEL}_${ARCH}/bin"
+          if [[ ! -x "${bin_dir}/gh" ]]; then
+            echo "Extracted gh binary missing at ${bin_dir}/gh"
+            return 1
+          fi
+          echo "${bin_dir}" >> "$GITHUB_PATH"
+          export PATH="${bin_dir}:${PATH}"
+          return 0
+        }
 
-        echo "${BIN_DIR}" >> "$GITHUB_PATH"
-        export PATH="${BIN_DIR}:${PATH}"
+        list_release_tags() {
+          local tags=''
+          if command -v gh >/dev/null 2>&1; then
+            tags="$(gh api 'repos/cli/cli/releases?per_page=8' --jq '.[] | select(.prerelease==false and .draft==false) | .tag_name' 2>/dev/null || true)"
+          fi
+          if [[ -z "$tags" ]]; then
+            tags="$(curl -fsSL --retry 3 --retry-delay 2 'https://api.github.com/repos/cli/cli/releases?per_page=8' \
+              | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' || true)"
+          fi
+          if [[ -n "$LATEST_TAG" ]]; then
+            printf '%s\n%s\n' "$LATEST_TAG" "$tags" | awk 'NF && !seen[$0]++'
+          else
+            printf '%s\n' "$tags" | awk 'NF && !seen[$0]++'
+          fi
+        }
+
+        INSTALLED=0
+        while IFS= read -r tag; do
+          [[ -z "$tag" ]] && continue
+          if download_and_install "$tag"; then
+            INSTALLED=1
+            break
+          fi
+        done < <(list_release_tags)
 
         AFTER="$(current_version)"
-        echo "Runner gh after: ${AFTER} ($(command -v gh))"
-        gh --version
-
-        if [[ "$AFTER" == 'none' ]] || ! version_ge "$AFTER" "$MIN_GH_VERSION"; then
-          echo "::error::gh after install is ${AFTER}; need >= ${MIN_GH_VERSION}"
-          exit 1
+        echo "Runner gh after: ${AFTER} ($(command -v gh 2>/dev/null || echo 'not on PATH'))"
+        if command -v gh >/dev/null 2>&1; then
+          gh --version
         fi
+
+        if [[ "$AFTER" != 'none' ]] && version_ge "$AFTER" "$MIN_GH_VERSION"; then
+          if [[ "$INSTALLED" -eq 0 ]]; then
+            echo "::warning::Could not download a newer gh; continuing with runner gh ${AFTER}."
+          fi
+          exit 0
+        fi
+
+        echo "::error::Could not install gh >= ${MIN_GH_VERSION} (have ${AFTER}). GitHub Releases download failed and the runner binary is too old."
+        exit 1
 
     - name: Run merge-queue command
       shell: bash
