@@ -21,7 +21,10 @@ on:
         type: string
         default: 'requires action'
       tier1_labels:
-        description: 'Comma-separated labels that put a PR in priority tier 1.'
+        description: >
+          Ordered comma- or newline-separated labels that focus dequeue
+          priority. First label is highest, then the second, and so on.
+          Product-specific names belong in the calling repo.
         type: string
         default: 'bug'
       tier1_title_regex:
@@ -138,9 +141,13 @@ jobs:
           command: check-completion
           github_token: ${{ secrets.merge_queue_pat }}
           target_branch: ${{ inputs.target_branch }}
+          merge_method: ${{ inputs.merge_method }}
           ready_label: ${{ inputs.ready_label }}
           processing_label: ${{ inputs.processing_label }}
           requires_action_label: ${{ inputs.requires_action_label }}
+          tier1_labels: ${{ inputs.tier1_labels }}
+          tier1_title_regex: ${{ inputs.tier1_title_regex }}
+          tier2_title_regex: ${{ inputs.tier2_title_regex }}
           dry_run: ${{ inputs.dry_run }}
 
   cleanup:
@@ -161,7 +168,13 @@ jobs:
           command: cleanup
           github_token: ${{ secrets.merge_queue_pat }}
           target_branch: ${{ inputs.target_branch }}
+          merge_method: ${{ inputs.merge_method }}
+          ready_label: ${{ inputs.ready_label }}
           processing_label: ${{ inputs.processing_label }}
+          requires_action_label: ${{ inputs.requires_action_label }}
+          tier1_labels: ${{ inputs.tier1_labels }}
+          tier1_title_regex: ${{ inputs.tier1_title_regex }}
+          tier2_title_regex: ${{ inputs.tier2_title_regex }}
           event_pr_number: ${{ github.event.pull_request.number }}
           event_action: ${{ github.event.action }}
           dry_run: ${{ inputs.dry_run }}
@@ -188,8 +201,12 @@ jobs:
           command: watchdog
           github_token: ${{ secrets.merge_queue_pat }}
           target_branch: ${{ inputs.target_branch }}
+          merge_method: ${{ inputs.merge_method }}
           ready_label: ${{ inputs.ready_label }}
           processing_label: ${{ inputs.processing_label }}
           requires_action_label: ${{ inputs.requires_action_label }}
+          tier1_labels: ${{ inputs.tier1_labels }}
+          tier1_title_regex: ${{ inputs.tier1_title_regex }}
+          tier2_title_regex: ${{ inputs.tier2_title_regex }}
           stale_after_minutes: ${{ inputs.stale_after_minutes }}
           dry_run: ${{ inputs.dry_run }}

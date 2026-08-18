@@ -30,6 +30,7 @@
 //                                 being insta-evicted on its first transient
 //                                 cancellation.
 import { execFileSync } from 'node:child_process'
+import { classifyTier as rankPullRequest, parseLabelList } from './priority.mjs'
 
 const REPO = requireEnv('GITHUB_REPOSITORY')
 const COMMAND = requireEnv('MQ_COMMAND')
@@ -38,10 +39,10 @@ const MERGE_METHOD = process.env.MQ_MERGE_METHOD || 'squash'
 const READY_LABEL = process.env.MQ_READY_LABEL || 'ready to merge'
 const PROCESSING_LABEL = process.env.MQ_PROCESSING_LABEL || 'merge-queue: processing'
 const REQUIRES_ACTION_LABEL = process.env.MQ_REQUIRES_ACTION_LABEL || 'requires action'
-const TIER1_LABELS = (process.env.MQ_TIER1_LABELS || 'bug')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean)
+// Ordered focus labels from the consumer. First match wins. The default
+// is the generic `bug` label; product-specific names (workspace, etc.)
+// belong in the calling repo, not here.
+const TIER1_LABELS = parseLabelList(process.env.MQ_TIER1_LABELS, 'bug')
 const TIER1_TITLE_REGEX = new RegExp(process.env.MQ_TIER1_TITLE_REGEX || '^\\[HOTFIX\\]', 'i')
 const TIER2_TITLE_REGEX = new RegExp(process.env.MQ_TIER2_TITLE_REGEX || '^\\[HCP-', 'i')
 const STALE_AFTER_MINUTES = Number(process.env.MQ_STALE_AFTER_MINUTES || '90')
@@ -523,10 +524,11 @@ async function rerunCancelledChecks(prNumber, cancelled) {
 // ---- priority classification ----
 
 function classifyTier(pr) {
-  const labelNames = (pr.labels || []).map((l) => l.name)
-  if (TIER1_LABELS.some((l) => labelNames.includes(l)) || TIER1_TITLE_REGEX.test(pr.title)) return 1
-  if (TIER2_TITLE_REGEX.test(pr.title)) return 2
-  return 3
+  return rankPullRequest(pr, {
+    labels: TIER1_LABELS,
+    tier1TitleRegex: TIER1_TITLE_REGEX,
+    tier2TitleRegex: TIER2_TITLE_REGEX,
+  })
 }
 
 function getReadySince(prNumber, fallback) {
@@ -897,6 +899,14 @@ async function dequeue(depth = 0, excludePr = '') {
     if (a.tier !== b.tier) return a.tier - b.tier
     return new Date(a.readySince) - new Date(b.readySince)
   })
+
+  if (depth === 0) {
+    const focus = TIER1_LABELS.length > 0 ? TIER1_LABELS.join(' > ') : '(none)'
+    log(`Priority labels (first match wins): ${focus}`)
+    log(
+      `Queue order: ${withMeta.map((item) => `#${item.number}(t${item.tier})`).join(', ')}`,
+    )
+  }
 
   // Walk candidates in priority order and claim the first one native
   // auto-merge could actually complete. Drafts and PRs whose review state
