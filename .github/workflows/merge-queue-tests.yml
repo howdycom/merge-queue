@@ -1,0 +1,30 @@
+name: merge-queue tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "actions/merge-queue/**"
+      - ".github/workflows/merge-queue-tests.yml"
+  pull_request:
+    paths:
+      - "actions/merge-queue/**"
+      - ".github/workflows/merge-queue-tests.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: actions/merge-queue
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run priority ranking tests
+        run: node --test priority.test.mjs

@@ -56,7 +56,13 @@ jobs:
     uses: howdycom/workflows/.github/workflows/merge-queue.yml@v1
     with:
       target_branch: develop
-      tier1_labels: bug
+      # Ordered focus list — first label is highest priority. Keep
+      # product-specific names here, not in howdycom/workflows.
+      # Comma-separated or a YAML block both work:
+      #   tier1_labels: |
+      #     bug
+      #     security
+      tier1_labels: bug, security
       tier1_title_regex: '^\[HOTFIX\]'
       tier2_title_regex: '^\[HCP-'
     secrets:
@@ -67,7 +73,7 @@ jobs:
 
 A PR gets the `ready to merge` label once it's approved and green. From there it's automatic — no one manually decides "who merges next":
 
-- **Priority order** — not strict FIFO. Configurable via `tier1_labels`/`tier1_title_regex`/`tier2_title_regex`, defaulting to: PRs labeled `bug` or titled `[HOTFIX]...` go first, then PRs titled `[HCP-...]`, then everything else. Within a tier, whoever's been ready longest goes first (read from when `ready to merge` was actually applied, not PR number or creation date).
+- **Priority order** — not strict FIFO. Configurable via `tier1_labels`/`tier1_title_regex`/`tier2_title_regex`. `tier1_labels` is an **ordered** list (comma- or newline-separated): the first matching label wins, then the second, and so on. Title `[HOTFIX]...` stays at rank 1 with the first label so emergencies still jump the queue. After every configured focus label: titles matching `tier2_title_regex` (default `[HCP-...]`), then everything else. A PR that carries several focus labels uses the earliest match. Within a rank, whoever's been ready longest goes first (read from when `ready to merge` was actually applied, not PR number or creation date). Default when a consumer omits the list: `bug`. Product-specific labels (`workspace`, etc.) belong in the calling repo so this workflow stays reusable.
 - **One PR at a time** — `MERGE_QUEUE_PR` is the single in-flight claim. New ready PRs wait; only the claimed PR is `update-branch`'d and watched.
 - **The happy path is free** — on a push to `target_branch`, the next PR in line gets `update-branch`'d against the latest target and has auto-merge enabled (the workflow does this itself — see `queue.mjs`'s `enableAutoMerge`). `dequeue` polls in-job for up to ~60s to confirm the SHA actually changed post-`update-branch`, then GitHub's own auto-merge finishes the job once checks re-pass.
 - **Re-sync when the base moves (critical)** — if a PR is already in flight and `target_branch` advances (manual merges, another path landing develop), branch protection with `required_status_checks.strict=true` makes native auto-merge **unable** to finish a `BEHIND` PR. On every subsequent `dequeue` trigger (including push to develop), the queue now **re-evaluates** the in-flight PR via `maintainInFlight`: re-`update-branch` when `mergeStateStatus=BEHIND`, clear and advance when closed/unlabeled, evict on real conflicts. Previously it logged "Already in flight. Nothing to do." and left healthy PRs stranded until the watchdog wrongly `requires action`'d them.

@@ -39,7 +39,11 @@ inputs:
     required: false
     default: 'requires action'
   tier1_labels:
-    description: 'Comma-separated labels that put a PR in priority tier 1.'
+    description: >
+      Ordered comma- or newline-separated labels that focus dequeue priority.
+      First label is highest priority, then the second, and so on. A PR that
+      matches several of these uses the earliest match. Product-specific
+      names belong in the calling repo — this action does not hardcode them.
     required: false
     default: 'bug'
   tier1_title_regex:
