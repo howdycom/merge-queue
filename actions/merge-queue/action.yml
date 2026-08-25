@@ -51,9 +51,26 @@ inputs:
     required: false
     default: '^\[HOTFIX\]'
   tier2_title_regex:
-    description: 'Title regex (case-insensitive) that puts a PR in priority tier 2.'
+    description: >
+      Title regex (case-insensitive) that ranks a PR after every focus
+      label and above unlabeled / [TECH] PRs. Default is leftover Jira
+      `[HCP-…]` titles; callers with GitHub issues should pass
+      `^\[(#\d+|HCP-)` so `[#1234]` ranks here too.
     required: false
     default: '^\[HCP-'
+  deprioritized_title_regex:
+    description: >
+      Title regex (case-insensitive) ranked below unlabeled human PRs
+      and above Dependabot. Default `[TECH]`.
+    required: false
+    default: '^\[TECH\]'
+  deprioritized_authors:
+    description: >
+      Comma- or newline-separated GitHub logins always ranked last,
+      even when the PR also carries a focus label. Default Dependabot
+      variants (`app/dependabot`, `dependabot[bot]`, `dependabot`).
+    required: false
+    default: 'dependabot,dependabot[bot],app/dependabot'
   stale_after_minutes:
     description: 'For the watchdog command: evict the in-flight PR if it has been claimed longer than this with no resolution.'
     required: false
@@ -191,6 +208,8 @@ runs:
         MQ_TIER1_LABELS: ${{ inputs.tier1_labels }}
         MQ_TIER1_TITLE_REGEX: ${{ inputs.tier1_title_regex }}
         MQ_TIER2_TITLE_REGEX: ${{ inputs.tier2_title_regex }}
+        MQ_DEPRIORITIZED_TITLE_REGEX: ${{ inputs.deprioritized_title_regex }}
+        MQ_DEPRIORITIZED_AUTHORS: ${{ inputs.deprioritized_authors }}
         MQ_STALE_AFTER_MINUTES: ${{ inputs.stale_after_minutes }}
         MQ_EVENT_PR_NUMBER: ${{ inputs.event_pr_number }}
         MQ_EVENT_ACTION: ${{ inputs.event_action }}
