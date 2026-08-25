@@ -45,6 +45,14 @@ const REQUIRES_ACTION_LABEL = process.env.MQ_REQUIRES_ACTION_LABEL || 'requires 
 const TIER1_LABELS = parseLabelList(process.env.MQ_TIER1_LABELS, 'bug')
 const TIER1_TITLE_REGEX = new RegExp(process.env.MQ_TIER1_TITLE_REGEX || '^\\[HOTFIX\\]', 'i')
 const TIER2_TITLE_REGEX = new RegExp(process.env.MQ_TIER2_TITLE_REGEX || '^\\[HCP-', 'i')
+const DEPRIORITIZED_TITLE_REGEX = new RegExp(
+  process.env.MQ_DEPRIORITIZED_TITLE_REGEX || '^\\[TECH\\]',
+  'i',
+)
+const DEPRIORITIZED_AUTHORS = parseLabelList(
+  process.env.MQ_DEPRIORITIZED_AUTHORS,
+  'dependabot,dependabot[bot],app/dependabot',
+)
 const STALE_AFTER_MINUTES = Number(process.env.MQ_STALE_AFTER_MINUTES || '90')
 const EVENT_PR_NUMBER = process.env.MQ_EVENT_PR_NUMBER || ''
 const EVENT_ACTION = process.env.MQ_EVENT_ACTION || ''
@@ -528,6 +536,8 @@ function classifyTier(pr) {
     labels: TIER1_LABELS,
     tier1TitleRegex: TIER1_TITLE_REGEX,
     tier2TitleRegex: TIER2_TITLE_REGEX,
+    deprioritizedTitleRegex: DEPRIORITIZED_TITLE_REGEX,
+    deprioritizedAuthors: DEPRIORITIZED_AUTHORS,
   })
 }
 
@@ -872,7 +882,7 @@ async function dequeue(depth = 0, excludePr = '') {
     '--limit',
     '100',
     '--json',
-    'number,title,labels,createdAt,isDraft,reviewDecision',
+    'number,title,labels,createdAt,isDraft,reviewDecision,author',
   ])
   // excludePr is the PR a caller just evicted, requeued, or watched close.
   // `gh pr list` reads GitHub's search index, which lags label/state
@@ -903,6 +913,9 @@ async function dequeue(depth = 0, excludePr = '') {
   if (depth === 0) {
     const focus = TIER1_LABELS.length > 0 ? TIER1_LABELS.join(' > ') : '(none)'
     log(`Priority labels (first match wins): ${focus}`)
+    log(
+      `Deprioritized after ticket titles: ${DEPRIORITIZED_TITLE_REGEX} then authors ${DEPRIORITIZED_AUTHORS.join(', ') || '(none)'}`,
+    )
     log(
       `Queue order: ${withMeta.map((item) => `#${item.number}(t${item.tier})`).join(', ')}`,
     )

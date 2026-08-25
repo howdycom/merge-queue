@@ -33,6 +33,18 @@ on:
       tier2_title_regex:
         type: string
         default: '^\[HCP-'
+      deprioritized_title_regex:
+        description: >
+          Title regex ranked below unlabeled human PRs and above
+          Dependabot. Default `[TECH]`.
+        type: string
+        default: '^\[TECH\]'
+      deprioritized_authors:
+        description: >
+          Comma-separated logins always ranked last (Dependabot by
+          default), even when the PR also carries a focus label.
+        type: string
+        default: 'dependabot,dependabot[bot],app/dependabot'
       stale_after_minutes:
         description: >
           Watchdog budget for a single claim. Past this, failing required
@@ -87,6 +99,8 @@ jobs:
           tier1_labels: ${{ inputs.tier1_labels }}
           tier1_title_regex: ${{ inputs.tier1_title_regex }}
           tier2_title_regex: ${{ inputs.tier2_title_regex }}
+          deprioritized_title_regex: ${{ inputs.deprioritized_title_regex }}
+          deprioritized_authors: ${{ inputs.deprioritized_authors }}
           dry_run: ${{ inputs.dry_run }}
 
   check-completion:
@@ -148,6 +162,8 @@ jobs:
           tier1_labels: ${{ inputs.tier1_labels }}
           tier1_title_regex: ${{ inputs.tier1_title_regex }}
           tier2_title_regex: ${{ inputs.tier2_title_regex }}
+          deprioritized_title_regex: ${{ inputs.deprioritized_title_regex }}
+          deprioritized_authors: ${{ inputs.deprioritized_authors }}
           dry_run: ${{ inputs.dry_run }}
 
   cleanup:
@@ -175,6 +191,8 @@ jobs:
           tier1_labels: ${{ inputs.tier1_labels }}
           tier1_title_regex: ${{ inputs.tier1_title_regex }}
           tier2_title_regex: ${{ inputs.tier2_title_regex }}
+          deprioritized_title_regex: ${{ inputs.deprioritized_title_regex }}
+          deprioritized_authors: ${{ inputs.deprioritized_authors }}
           event_pr_number: ${{ github.event.pull_request.number }}
           event_action: ${{ github.event.action }}
           dry_run: ${{ inputs.dry_run }}
@@ -208,5 +226,7 @@ jobs:
           tier1_labels: ${{ inputs.tier1_labels }}
           tier1_title_regex: ${{ inputs.tier1_title_regex }}
           tier2_title_regex: ${{ inputs.tier2_title_regex }}
+          deprioritized_title_regex: ${{ inputs.deprioritized_title_regex }}
+          deprioritized_authors: ${{ inputs.deprioritized_authors }}
           stale_after_minutes: ${{ inputs.stale_after_minutes }}
           dry_run: ${{ inputs.dry_run }}
