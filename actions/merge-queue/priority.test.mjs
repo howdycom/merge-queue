@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { classifyTier, normalizeAuthor, parseLabelList } from './priority.mjs'
+import { classifyTier, compareQueueItems, normalizeAuthor, parseLabelList } from './priority.mjs'
 
 const HOTFIX = /^\[HOTFIX\]/i
 const HCP = /^\[HCP-/i
@@ -197,5 +197,64 @@ describe('classifyTier — omitting deprioritize options keeps leftover ranks', 
   it('still ranks [TECH] with other leftover PRs when no deprioritized regex is set', () => {
     assert.equal(rank(pr('[TECH] chore', ['ready to merge'])), 3)
     assert.equal(rank(pr('plain', ['ready to merge'])), 3)
+  })
+})
+
+describe('compareQueueItems — oldest PR first within a tier', () => {
+  it('keeps lower tier numbers ahead of older PRs in a later tier', () => {
+    const hotfix = { tier: 1, createdAt: '2026-08-20T00:00:00Z', number: 300 }
+    const oldHuman = { tier: 6, createdAt: '2026-01-01T00:00:00Z', number: 50 }
+    const ordered = [oldHuman, hotfix].sort(compareQueueItems)
+    assert.equal(ordered[0].number, 300)
+  })
+
+  it('orders same-tier PRs oldest createdAt first, even if a newer PR was labeled ready earlier', () => {
+    const older = {
+      tier: 5,
+      createdAt: '2026-01-01T00:00:00Z',
+      number: 100,
+      readySince: '2026-08-25T00:00:00Z',
+    }
+    const newer = {
+      tier: 5,
+      createdAt: '2026-08-01T00:00:00Z',
+      number: 200,
+      readySince: '2026-08-01T00:00:00Z',
+    }
+    const ordered = [newer, older].sort(compareQueueItems)
+    assert.deepEqual(
+      ordered.map((item) => item.number),
+      [100, 200],
+    )
+  })
+
+  it('breaks a createdAt tie with the lower PR number', () => {
+    const laterNumber = { tier: 2, createdAt: '2026-04-01T12:00:00Z', number: 80 }
+    const earlierNumber = { tier: 2, createdAt: '2026-04-01T12:00:00Z', number: 40 }
+    const ordered = [laterNumber, earlierNumber].sort(compareQueueItems)
+    assert.deepEqual(
+      ordered.map((item) => item.number),
+      [40, 80],
+    )
+  })
+
+  it('places a PR with a valid createdAt ahead of one missing the timestamp', () => {
+    const dated = { tier: 4, createdAt: '2026-03-01T00:00:00Z', number: 90 }
+    const undated = { tier: 4, number: 10 }
+    const ordered = [undated, dated].sort(compareQueueItems)
+    assert.deepEqual(
+      ordered.map((item) => item.number),
+      [90, 10],
+    )
+  })
+
+  it('falls back to PR number when neither item has a parseable createdAt', () => {
+    const later = { tier: 3, createdAt: 'not-a-date', number: 12 }
+    const earlier = { tier: 3, number: 3 }
+    const ordered = [later, earlier].sort(compareQueueItems)
+    assert.deepEqual(
+      ordered.map((item) => item.number),
+      [3, 12],
+    )
   })
 })

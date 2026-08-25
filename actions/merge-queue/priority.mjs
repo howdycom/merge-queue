@@ -107,3 +107,24 @@ function matches(regex, text) {
   regex.lastIndex = 0
   return regex.test(text)
 }
+
+/**
+ * Sort comparator for the ready queue.
+ * Lower tier number first (higher priority). Within a tier, oldest PR
+ * first (`createdAt`, then number) so older PRs merge before newer ones
+ * added to the same rank. Label-applied time is not part of the order.
+ *
+ * @param {{ tier: number, createdAt?: string, number?: number }} a
+ * @param {{ tier: number, createdAt?: string, number?: number }} b
+ * @returns {number}
+ */
+export function compareQueueItems(a, b) {
+  if (a.tier !== b.tier) return a.tier - b.tier
+  const aCreated = Date.parse(a.createdAt || '')
+  const bCreated = Date.parse(b.createdAt || '')
+  const aValid = Number.isFinite(aCreated)
+  const bValid = Number.isFinite(bCreated)
+  if (aValid && bValid && aCreated !== bCreated) return aCreated - bCreated
+  if (aValid !== bValid) return aValid ? -1 : 1
+  return (a.number || 0) - (b.number || 0)
+}
