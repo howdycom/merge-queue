@@ -49,7 +49,8 @@ on:
         description: >
           Watchdog budget for a single claim. Past this, failing required
           checks evict; still-pending required checks soft-requeue (keep
-          ready label, move to back of tier); otherwise diagnostic eviction.
+          ready label, skip that PR for this pass); otherwise diagnostic
+          eviction.
           Successful re-syncs refresh the claim clock, so a PR that keeps
           getting legitimately rebased is not false-evicted mid-CI.
         type: number

@@ -29,8 +29,28 @@
 //                                 re-queued by a human starts over instead of
 //                                 being insta-evicted on its first transient
 //                                 cancellation.
+//   MERGE_QUEUE_YIELD_COUNTS    - compact `prNumber:count` map of how many
+//                                 times each ready PR has soft-requeued
+//                                 (pending checks, missing approval, draft).
+//                                 compareQueueItems uses this as a within-tier
+//                                 tiebreak ahead of createdAt so a PR that
+//                                 already yielded sorts behind peers it
+//                                 blocked, restoring the old readySince-bump
+//                                 demotion that createdAt-only ordering lost.
+//                                 Dropped on evict / close / unlabeled so a
+//                                 human re-queue starts at 0; pruned on
+//                                 dequeue for PRs no longer in the ready list.
 import { execFileSync } from 'node:child_process'
-import { classifyTier as rankPullRequest, parseLabelList } from './priority.mjs'
+import {
+  classifyTier as rankPullRequest,
+  compareQueueItems,
+  dropYieldCount,
+  incrementYieldCount,
+  parseLabelList,
+  parseYieldCounts,
+  pruneYieldCounts,
+  serializeYieldCounts,
+} from './priority.mjs'
 
 const REPO = requireEnv('GITHUB_REPOSITORY')
 const COMMAND = requireEnv('MQ_COMMAND')
@@ -76,7 +96,7 @@ const MAX_DEQUEUE_RECURSION_DEPTH = 20
 // gets before it's evicted instead of released for another retry. Without
 // this, a permanent-but-not-a-conflict failure (a fork PR this token can't
 // update, a branch protection quirk, etc.) reselects the same PR forever --
-// dequeue() always sorts to the same tier/readySince-oldest candidate, so
+// dequeue() always sorts to the same tier/createdAt-oldest candidate, so
 // nothing behind it in the queue is ever reached, even though a transient
 // or system-wide failure (a token permission gap, say) deserves a retry
 // rather than an immediate eviction. See MERGE_QUEUE_UPDATE_FAIL_PR /
@@ -278,6 +298,29 @@ function clearQueueState() {
   deleteVar('MERGE_QUEUE_CLAIMED_AT')
 }
 
+function readYieldCountsRaw() {
+  return getVar('MERGE_QUEUE_YIELD_COUNTS')
+}
+
+function writeYieldCounts(serialized) {
+  if (serialized) setVar('MERGE_QUEUE_YIELD_COUNTS', serialized)
+  else deleteVar('MERGE_QUEUE_YIELD_COUNTS')
+}
+
+function bumpYieldCount(prNumber) {
+  writeYieldCounts(incrementYieldCount(readYieldCountsRaw(), prNumber))
+}
+
+function clearYieldCount(prNumber) {
+  writeYieldCounts(dropYieldCount(readYieldCountsRaw(), prNumber))
+}
+
+function pruneStaleYieldCounts(prNumbers) {
+  const raw = readYieldCountsRaw()
+  const next = pruneYieldCounts(raw, prNumbers)
+  if (next !== serializeYieldCounts(parseYieldCounts(raw))) writeYieldCounts(next)
+}
+
 // ---- PR mutations ----
 
 function addLabel(prNumber, label) {
@@ -364,6 +407,7 @@ async function evict(prNumber, reason, depth = 0) {
   log(`Evicting PR #${prNumber}: ${reason}`)
   removeLabel(prNumber, READY_LABEL)
   removeLabel(prNumber, PROCESSING_LABEL)
+  clearYieldCount(prNumber)
   addLabel(prNumber, REQUIRES_ACTION_LABEL)
   comment(
     prNumber,
@@ -386,12 +430,13 @@ async function evict(prNumber, reason, depth = 0) {
 }
 
 /**
- * Release the claim and move a still-viable PR to the back of its priority
- * tier. readySince is derived from the ready label's most recent "labeled"
- * timeline event (see getReadySince), so removing and re-adding the label
- * is exactly what demotes it within its tier. Used instead of evict() when
- * the PR is not at fault (slow checks, an approval that disappeared) -- it
- * keeps the ready label so no human has to re-queue it.
+ * Release the claim so another ready PR can proceed this pass. Removing
+ * and re-adding the ready label no longer demotes by itself (order is
+ * createdAt, not readySince); bumpYieldCount is what sinks this PR behind
+ * same-rank peers it already blocked. excludePr still skips it on the
+ * chained dequeue in this pass (search-index lag). Used instead of
+ * evict() when the PR is not at fault (slow checks, an approval that
+ * disappeared) -- it keeps the ready label so no human has to re-queue it.
  */
 async function softRequeueToBack(prNumber, body, depth = 0) {
   // Clear the claim BEFORE removing the ready label so the unlabeled
@@ -400,10 +445,9 @@ async function softRequeueToBack(prNumber, body, depth = 0) {
   removeLabel(prNumber, PROCESSING_LABEL)
   clearQueueState()
   removeLabel(prNumber, READY_LABEL)
-  // Re-add ready so it stays in the queue, but with a fresh readySince
-  // (end of the line within its tier). Guarded: if the re-add fails after
-  // the remove succeeded, the PR would otherwise silently leave the queue
-  // with no label, no comment, and only a red Actions run as evidence.
+  // Re-add ready so it stays in the queue. Guarded: if the re-add fails
+  // after the remove succeeded, the PR would otherwise silently leave the
+  // queue with no label, no comment, and only a red Actions run as evidence.
   try {
     addLabel(prNumber, READY_LABEL)
   } catch (err) {
@@ -411,10 +455,11 @@ async function softRequeueToBack(prNumber, body, depth = 0) {
       `Warning: could not re-add "${READY_LABEL}" to PR #${prNumber} during soft-requeue: ${String(err.message || err).split('\n')[0]}. The PR is OUT of the queue until a human re-adds the label.`,
     )
   }
+  bumpYieldCount(prNumber)
   comment(prNumber, body)
-  // Exclude the just-requeued PR from the immediate re-pick: it moved to
-  // the back of its tier by definition, and the search index may not have
-  // caught up with the label churn yet anyway.
+  // Exclude the just-requeued PR from the immediate re-pick so a peer can
+  // proceed this pass. The search index may not have caught up with the
+  // label churn yet anyway.
   await dequeue(depth + 1, String(prNumber))
 }
 
@@ -627,7 +672,7 @@ async function updateBranchAndWatch(prNumber, depth = 0) {
     //
     // But if the *same* PR keeps failing this way, it's not a one-off
     // transient blip -- dequeue() always re-sorts to the same tier/
-    // readySince-oldest candidate, so an unlucky PR with a permanent,
+    // createdAt-oldest candidate, so an unlucky PR with a permanent,
     // PR-specific reason for failing (a fork branch this token can't
     // update, some other per-PR quirk) would get reselected and fail again
     // on every subsequent trigger forever, starving everything behind it in
@@ -739,6 +784,7 @@ async function maintainInFlight(prNumber, depth = 0) {
   if (snap.state !== 'OPEN') {
     log(`In-flight PR #${prNumber} is ${snap.state}. Clearing claim and advancing the queue.`)
     removeLabel(prNumber, PROCESSING_LABEL)
+    clearYieldCount(prNumber)
     clearQueueState()
     await dequeue(depth + 1, String(prNumber))
     return
@@ -748,6 +794,7 @@ async function maintainInFlight(prNumber, depth = 0) {
   if (!labelNames.includes(READY_LABEL)) {
     log(`In-flight PR #${prNumber} no longer has \`${READY_LABEL}\`. Clearing claim and advancing the queue.`)
     removeLabel(prNumber, PROCESSING_LABEL)
+    clearYieldCount(prNumber)
     clearQueueState()
     await dequeue(depth + 1, String(prNumber))
     return
@@ -787,7 +834,7 @@ async function maintainInFlight(prNumber, depth = 0) {
   if (snap.reviewDecision === 'REVIEW_REQUIRED') {
     await softRequeueToBack(
       prNumber,
-      `Soft-requeued by the merge queue: this PR needs an approving review it does not currently have (reviewDecision=REVIEW_REQUIRED), so native auto-merge cannot complete it. It keeps \`${READY_LABEL}\` and re-enters at the back of its priority tier; it becomes eligible again once approved.`,
+      `Soft-requeued by the merge queue: this PR needs an approving review it does not currently have (reviewDecision=REVIEW_REQUIRED), so native auto-merge cannot complete it. It keeps \`${READY_LABEL}\` and yields this pass so another ready PR can proceed; it now sorts behind same-rank peers it has already yielded to and becomes eligible again once approved.`,
       depth,
     )
     return
@@ -899,16 +946,18 @@ async function dequeue(depth = 0, excludePr = '') {
     return
   }
 
+  const yieldCounts = parseYieldCounts(readYieldCountsRaw())
   const withMeta = candidates.map((pr) => ({
     ...pr,
     tier: classifyTier(pr),
     readySince: getReadySince(pr.number, pr.createdAt),
+    yieldCount: yieldCounts[String(pr.number)] || 0,
   }))
 
-  withMeta.sort((a, b) => {
-    if (a.tier !== b.tier) return a.tier - b.tier
-    return new Date(a.readySince) - new Date(b.readySince)
-  })
+  withMeta.sort(compareQueueItems)
+  // Keep the just-released PR even if the search index has not returned it
+  // yet -- that is the count we just incremented in softRequeueToBack.
+  pruneStaleYieldCounts([...prs.map((pr) => pr.number), excludePr].filter(Boolean))
 
   if (depth === 0) {
     const focus = TIER1_LABELS.length > 0 ? TIER1_LABELS.join(' > ') : '(none)'
@@ -917,7 +966,9 @@ async function dequeue(depth = 0, excludePr = '') {
       `Deprioritized after ticket titles: ${DEPRIORITIZED_TITLE_REGEX} then authors ${DEPRIORITIZED_AUTHORS.join(', ') || '(none)'}`,
     )
     log(
-      `Queue order: ${withMeta.map((item) => `#${item.number}(t${item.tier})`).join(', ')}`,
+      `Queue order: ${withMeta
+        .map((item) => `#${item.number}(t${item.tier}${item.yieldCount ? `,y${item.yieldCount}` : ''})`)
+        .join(', ')}`,
     )
   }
 
@@ -954,7 +1005,9 @@ async function dequeue(depth = 0, excludePr = '') {
       continue
     }
 
-    log(`Dequeuing PR #${next.number} "${next.title}" (tier ${next.tier}, ready since ${next.readySince})`)
+    log(
+      `Dequeuing PR #${next.number} "${next.title}" (tier ${next.tier}, created ${next.createdAt}, yields ${next.yieldCount || 0}, ready since ${next.readySince})`,
+    )
 
     // Claim BEFORE calling update-branch so a crash mid-call is visible as
     // "stuck in flight" (catchable by the watchdog) rather than invisible.
@@ -1030,7 +1083,7 @@ async function checkCompletion() {
   if (snap.reviewDecision === 'REVIEW_REQUIRED') {
     await softRequeueToBack(
       pr,
-      `Soft-requeued by the merge queue: this PR needs an approving review it does not currently have (reviewDecision=REVIEW_REQUIRED), so native auto-merge cannot complete it. It keeps \`${READY_LABEL}\` and re-enters at the back of its priority tier; it becomes eligible again once approved.`,
+      `Soft-requeued by the merge queue: this PR needs an approving review it does not currently have (reviewDecision=REVIEW_REQUIRED), so native auto-merge cannot complete it. It keeps \`${READY_LABEL}\` and yields this pass so another ready PR can proceed; it now sorts behind same-rank peers it has already yielded to and becomes eligible again once approved.`,
     )
     return
   }
@@ -1145,6 +1198,7 @@ async function cleanup() {
 
   log(`Clearing in-flight state for PR #${EVENT_PR_NUMBER} (event: ${EVENT_ACTION}).`)
   removeLabel(EVENT_PR_NUMBER, PROCESSING_LABEL)
+  clearYieldCount(EVENT_PR_NUMBER)
   clearQueueState()
   // Not an eviction -- no requires-action label, no comment. Being closed
   // or unlabeled isn't a failure, just no longer applicable to what the
@@ -1255,17 +1309,14 @@ async function watchdog() {
       // a healthy PR whose only crime is slow E2E -- release the claim so
       // the rest of the queue can move, but leave ready-to-merge so it
       // re-enters naturally once a free slot opens (or the author re-labels).
-      // Actually: if we only clear claim and leave ready, dequeue will
-      // immediately re-pick the same oldest-ready PR and re-stuck. So we
-      // must either evict or keep waiting. Prefer a soft requeue to the
-      // *back* of the line by removing+re-adding ready... but label
-      // timestamps drive priority, and re-adding would update readySince
-      // to "now", demoting it behind older ready PRs. That's the right
-      // fairness behavior for a slow PR starving the queue.
+      // Soft-requeue yields this pass (`excludePr`) and increments
+      // MERGE_QUEUE_YIELD_COUNTS so the next dequeue sorts this PR behind
+      // same-rank peers it has already blocked, instead of re-claiming the
+      // oldest createdAt head every cycle.
       log(
         `PR #${stillPr} still has pending required checks after ${Math.round(elapsedMinutes)}m: ${pending
           .map((c) => c.name)
-          .join(', ')}. Soft-requeueing (remove+re-add \`${READY_LABEL}\`) so older-ready peers aren't starved by a single slow PR.`,
+          .join(', ')}. Soft-requeueing so another ready PR can proceed this pass instead of staying stuck behind slow checks.`,
       )
       await softRequeueToBack(
         stillPr,
@@ -1273,7 +1324,7 @@ async function watchdog() {
           .map((c) => c.name)
           .join(
             ', ',
-          )}). Left in the queue (still has \`${READY_LABEL}\`) but moved to the back of its priority tier so other ready PRs can proceed. No action needed unless checks ultimately fail.`,
+          )}). Left in the queue (still has \`${READY_LABEL}\`) and skipped for this pass so other ready PRs can proceed. It now sorts behind same-rank peers it has already yielded to. No action needed unless checks ultimately fail.`,
       )
       return
     }
