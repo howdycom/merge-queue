@@ -1,6 +1,16 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { classifyTier, compareQueueItems, normalizeAuthor, parseLabelList } from './priority.mjs'
+import {
+  classifyTier,
+  compareQueueItems,
+  dropYieldCount,
+  incrementYieldCount,
+  normalizeAuthor,
+  parseLabelList,
+  parseYieldCounts,
+  pruneYieldCounts,
+  serializeYieldCounts,
+} from './priority.mjs'
 
 const HOTFIX = /^\[HOTFIX\]/i
 const HCP = /^\[HCP-/i
@@ -256,5 +266,79 @@ describe('compareQueueItems — oldest PR first within a tier', () => {
       ordered.map((item) => item.number),
       [3, 12],
     )
+  })
+
+  it('sorts a PR that has already yielded behind same-tier peers it blocked', () => {
+    const oldestStuck = {
+      tier: 5,
+      createdAt: '2026-01-01T00:00:00Z',
+      number: 100,
+      yieldCount: 1,
+    }
+    const newerPeer = {
+      tier: 5,
+      createdAt: '2026-08-01T00:00:00Z',
+      number: 200,
+      yieldCount: 0,
+    }
+    const ordered = [oldestStuck, newerPeer].sort(compareQueueItems)
+    assert.deepEqual(
+      ordered.map((item) => item.number),
+      [200, 100],
+    )
+  })
+
+  it('does not let yieldCount jump a worse tier ahead of a better one', () => {
+    const yieldedHotfix = { tier: 1, createdAt: '2026-08-20T00:00:00Z', number: 300, yieldCount: 4 }
+    const unyieldedHuman = { tier: 6, createdAt: '2026-01-01T00:00:00Z', number: 50, yieldCount: 0 }
+    const ordered = [unyieldedHuman, yieldedHotfix].sort(compareQueueItems)
+    assert.equal(ordered[0].number, 300)
+  })
+
+  it('treats a missing yieldCount as 0 so unlabeled items stay oldest-first', () => {
+    const older = { tier: 2, createdAt: '2026-01-01T00:00:00Z', number: 10 }
+    const newerYielded = { tier: 2, createdAt: '2026-06-01T00:00:00Z', number: 20, yieldCount: 1 }
+    const ordered = [newerYielded, older].sort(compareQueueItems)
+    assert.deepEqual(
+      ordered.map((item) => item.number),
+      [10, 20],
+    )
+  })
+
+  it('breaks an equal yieldCount tie with createdAt, then PR number', () => {
+    const older = { tier: 4, yieldCount: 1, createdAt: '2026-02-01T00:00:00Z', number: 80 }
+    const newer = { tier: 4, yieldCount: 1, createdAt: '2026-03-01T00:00:00Z', number: 40 }
+    const ordered = [newer, older].sort(compareQueueItems)
+    assert.deepEqual(
+      ordered.map((item) => item.number),
+      [80, 40],
+    )
+  })
+})
+
+describe('yield count persistence encoding', () => {
+  it('parses prNumber:count pairs and ignores junk', () => {
+    assert.deepEqual(parseYieldCounts('123:1,456:2'), { 123: 1, 456: 2 })
+    assert.deepEqual(parseYieldCounts(' 123:1 , ,456:2,nope,7:,:3,9:-1,8:0 '), { 123: 1, 456: 2 })
+    assert.deepEqual(parseYieldCounts(''), {})
+    assert.deepEqual(parseYieldCounts(null), {})
+  })
+
+  it('serializes in PR-number order and drops non-positive counts', () => {
+    assert.equal(serializeYieldCounts({ 456: 2, 123: 1, 9: 0, bad: Number.NaN }), '123:1,456:2')
+    assert.equal(serializeYieldCounts({}), '')
+  })
+
+  it('increments an existing PR and starts a new one at 1', () => {
+    assert.equal(incrementYieldCount('', 100), '100:1')
+    assert.equal(incrementYieldCount('100:1,200:3', '100'), '100:2,200:3')
+    assert.equal(incrementYieldCount('100:1', ''), '100:1')
+  })
+
+  it('drops a PR and prunes anything not in the keep set', () => {
+    assert.equal(dropYieldCount('100:1,200:3', 100), '200:3')
+    assert.equal(dropYieldCount('100:1', 100), '')
+    assert.equal(pruneYieldCounts('100:1,200:3,300:1', [200, '300']), '200:3,300:1')
+    assert.equal(pruneYieldCounts('100:1', []), '')
   })
 })
