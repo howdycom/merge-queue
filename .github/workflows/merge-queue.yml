@@ -71,10 +71,11 @@ on:
       # validation failure, not a runtime error.
       merge_queue_pat:
         description: >
-          PAT scoped to this repo with Contents (write), Pull requests
-          (write), and Variables (read/write) -- GITHUB_TOKEN cannot write
-          repo Actions variables, which this design depends on.
-        required: true
+          Optional. When omitted, jobs use github.token. Grant the caller
+          contents: write, pull-requests: write, issues: write, actions: write,
+          checks: read, statuses: read, and contents: write. Queue state is a
+          JSON file on branch merge-queue-state, which GITHUB_TOKEN can write.
+        required: false
 
 concurrency:
   group: merge-queue-${{ github.repository }}
@@ -86,12 +87,19 @@ jobs:
       github.event_name == 'push' ||
       (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name == inputs.ready_label)
     runs-on: ${{ inputs.runs_on }}
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
+      checks: read
+      statuses: read
     steps:
       - name: Dequeue next PR
-        uses: howdycom/workflows/actions/merge-queue@v1
+        uses: howdycom/workflows/actions/merge-queue@679cb62aa5add3aa45f41ff59da7308e15d3285c
         with:
           command: dequeue
-          github_token: ${{ secrets.merge_queue_pat }}
+          github_token: ${{ secrets.merge_queue_pat || github.token }}
           target_branch: ${{ inputs.target_branch }}
           merge_method: ${{ inputs.merge_method }}
           ready_label: ${{ inputs.ready_label }}
@@ -105,56 +113,25 @@ jobs:
           dry_run: ${{ inputs.dry_run }}
 
   check-completion:
-    if: >
-      github.event_name == 'workflow_run' &&
-      vars.MERGE_QUEUE_SHA != '' &&
-      github.event.workflow_run.head_sha == vars.MERGE_QUEUE_SHA
+    # Optional fast path. Callers should not forward every workflow_run
+    # (concurrency storms cancel real dequeue/cleanup). Watchdog covers the
+    # same work on the schedule tick. This job still runs when a caller does
+    # forward a completion for the in-flight SHA.
+    if: github.event_name == 'workflow_run'
     runs-on: ${{ inputs.runs_on }}
     permissions:
-      # Fine-grained PATs can't read check-run results created by other Apps
-      # via GraphQL, no matter what repository permission is granted --
-      # confirmed the hard way (every required check except the one plain
-      # commit status failed to resolve, even with Commit statuses: read).
-      # The default GITHUB_TOKEN has these out of the box for its own
-      # repo/run, so this job's own token is used for the one read-only
-      # `gh pr checks --required` query instead -- everything else still
-      # goes through the PAT. All three below are actually needed: `gh pr
-      # checks`' underlying GraphQL query reads both StatusContext (needs
-      # statuses) and CheckRun -> checkSuite -> workflowRun -> workflow
-      # (needs actions) branches of the same rollup, not just checks --
-      # granting only `checks: read` would still fail on deploy-lock (a
-      # plain commit status) or on the workflow-run traversal. Also needs
-      # pull-requests: read -- before `gh pr checks` queries the rollup at
-      # all, it resolves the PR by number first (Finder.Find/findByNumber),
-      # which reads repository.pullRequest { id, number, headRefName } and
-      # fails without this if unspecified permissions default to none.
-      # Also needs contents: read -- the rollup query itself starts from
-      # commits(last: 1) on the PR, which needs read access to the commit/
-      # ref data before it can even reach statusCheckRollup; confirmed in
-      # production ("Resource not accessible by integration
-      # (node.statusCheckRollup.nodes.0)") after granting the four above
-      # without it.
-      #
-      # actions is WRITE (not read) since the cancelled-check re-run fix:
-      # queue.mjs re-runs required checks that ended cancelled -- a job
-      # timeout reports as cancelled, and evicting on it threw healthy PRs
-      # out of the queue in production -- via `gh run rerun --failed`, which
-      # needs Actions write. The default token is used for this too (the
-      # fine-grained PAT would need an extra grant nobody else needs).
-      # Callers' job-level permissions cap this: they must grant
-      # `actions: write` or the re-run degrades to a logged warning (the
-      # attempt cap still evicts eventually, so it fails safe).
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
       checks: read
       statuses: read
-      actions: write
-      pull-requests: read
-      contents: read
     steps:
       - name: Check in-flight PR's required checks
-        uses: howdycom/workflows/actions/merge-queue@v1
+        uses: howdycom/workflows/actions/merge-queue@679cb62aa5add3aa45f41ff59da7308e15d3285c
         with:
           command: check-completion
-          github_token: ${{ secrets.merge_queue_pat }}
+          github_token: ${{ secrets.merge_queue_pat || github.token }}
           target_branch: ${{ inputs.target_branch }}
           merge_method: ${{ inputs.merge_method }}
           ready_label: ${{ inputs.ready_label }}
@@ -170,20 +147,26 @@ jobs:
   cleanup:
     if: >
       github.event_name == 'pull_request' &&
-      vars.MERGE_QUEUE_PR != '' &&
-      format('{0}', github.event.pull_request.number) == vars.MERGE_QUEUE_PR &&
+      contains(github.event.pull_request.labels.*.name, inputs.processing_label) &&
       (
         github.event.action == 'closed' ||
         github.event.action == 'synchronize' ||
         (github.event.action == 'unlabeled' && github.event.label.name == inputs.ready_label)
       )
     runs-on: ${{ inputs.runs_on }}
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
+      checks: read
+      statuses: read
     steps:
       - name: Handle in-flight PR closed / unlabeled / synchronize
-        uses: howdycom/workflows/actions/merge-queue@v1
+        uses: howdycom/workflows/actions/merge-queue@679cb62aa5add3aa45f41ff59da7308e15d3285c
         with:
           command: cleanup
-          github_token: ${{ secrets.merge_queue_pat }}
+          github_token: ${{ secrets.merge_queue_pat || github.token }}
           target_branch: ${{ inputs.target_branch }}
           merge_method: ${{ inputs.merge_method }}
           ready_label: ${{ inputs.ready_label }}
@@ -202,23 +185,18 @@ jobs:
     if: github.event_name == 'schedule'
     runs-on: ${{ inputs.runs_on }}
     permissions:
-      # Same rationale as check-completion above: the watchdog reads required
-      # checks with the default GITHUB_TOKEN (fine-grained PATs can't read
-      # other Apps' check runs), and since the cancelled-check re-run fix it
-      # can also `gh run rerun --failed` a run whose job hit its timeout --
-      # hence actions: write. Previously this job declared no permissions and
-      # silently inherited whatever the caller granted; explicit is safer.
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
       checks: read
       statuses: read
-      actions: write
-      pull-requests: read
-      contents: read
     steps:
       - name: Maintain in-flight PR / soft-requeue / evict / idle dequeue
-        uses: howdycom/workflows/actions/merge-queue@v1
+        uses: howdycom/workflows/actions/merge-queue@679cb62aa5add3aa45f41ff59da7308e15d3285c
         with:
           command: watchdog
-          github_token: ${{ secrets.merge_queue_pat }}
+          github_token: ${{ secrets.merge_queue_pat || github.token }}
           target_branch: ${{ inputs.target_branch }}
           merge_method: ${{ inputs.merge_method }}
           ready_label: ${{ inputs.ready_label }}

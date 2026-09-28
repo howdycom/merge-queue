@@ -10,9 +10,10 @@ inputs:
     required: true
   github_token:
     description: >
-      PAT (not GITHUB_TOKEN -- it cannot write repo Actions variables) scoped
-      to this repo with: Contents (write, required by update-branch),
-      Pull requests (write), Variables (read/write).
+      Token used for labels, comments, update-branch, auto-merge, and the
+      merge-queue-state JSON file. The job GITHUB_TOKEN is enough when the
+      caller grants contents: write, pull-requests: write, issues: write,
+      and actions: write. A PAT is optional, not required.
     required: true
   target_branch:
     description: 'Branch PRs are queued to merge into (e.g. develop).'

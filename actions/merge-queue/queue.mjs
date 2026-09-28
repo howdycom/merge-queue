@@ -2,9 +2,12 @@
 // Zero-dependency Node script implementing the merge-queue state machine.
 // Commands: dequeue | check-completion | cleanup | watchdog (see action.yml).
 //
-// State lives in repo Actions variables (requires a PAT -- GITHUB_TOKEN
-// cannot write repo variables, see the design proposal's cost-model section
-// for why a file-based alternative was rejected):
+// State lives as JSON on branch `merge-queue-state` (contents: write on the
+// default GITHUB_TOKEN). Actions variables were the original store so a
+// caller `if:` could read `vars.MERGE_QUEUE_SHA` without a runner; that
+// required a user PAT because GITHUB_TOKEN cannot write repository variables.
+// Callers now gate pull_request cleanup on the processing label, and
+// check-completion is watchdog-driven, so the JSON store is enough:
 //   MERGE_QUEUE_PR              - PR number currently in flight, or unset if idle
 //   MERGE_QUEUE_SHA             - head SHA we're watching checks for ("pending"
 //                                 between claiming a PR and update-branch settling)
@@ -51,6 +54,7 @@ import {
   pruneYieldCounts,
   serializeYieldCounts,
 } from './priority.mjs'
+import { createQueueState } from './state.mjs'
 
 const REPO = requireEnv('GITHUB_REPOSITORY')
 const COMMAND = requireEnv('MQ_COMMAND')
@@ -167,9 +171,10 @@ function ghApiJson(method, endpoint, body) {
 // required check except the one plain commit status (deploy-lock), even
 // after adding Commit statuses: read. The default GITHUB_TOKEN has
 // checks: read for its own repo/run out of the box, so this one read-only
-// query uses that instead -- everything else (labels, variables,
-// update-branch) still goes through the PAT, which is why MQ_GITHUB_TOKEN
-// is a distinct, narrower credential rather than a blanket swap.
+// query uses that instead -- mutations (labels, state file, update-branch)
+// go through GH_TOKEN, which callers now pass as github.token. MQ_GITHUB_TOKEN
+// stays a distinct env var so check-run reads keep working if a caller still
+// supplies a PAT that cannot read other Apps' checks.
 function ghAsDefaultToken(args) {
   if (!process.env.MQ_GITHUB_TOKEN) {
     throw new Error(
@@ -252,51 +257,17 @@ function logAction(message) {
   log(DRY_RUN ? `[dry-run] would ${message}` : message)
 }
 
-// ---- state variables (require the PAT passed as GH_TOKEN) ----
+// ---- coordination state (JSON on merge-queue-state; GITHUB_TOKEN can write it) ----
 
-function getVar(name) {
-  try {
-    return ghJson(['api', `repos/${REPO}/actions/variables/${name}`]).value || ''
-  } catch (err) {
-    const message = String(err.message || err)
-    if (!/404/.test(message)) {
-      // A genuinely-absent variable 404s -- that's the expected "idle" case.
-      // Anything else (auth failure, rate limit, transient 5xx) getting
-      // silently treated the same way as "idle" risks a double-claim if it
-      // happens to coincide with another trigger. Surface it loudly instead
-      // of masking it, even though we still fall back to treating it as
-      // empty since there's no better recovery available here.
-      log(`Warning: unexpected error reading variable ${name}, treating as unset: ${message.split('\n')[0]}`)
-    }
-    return ''
-  }
-}
-
-function setVar(name, value) {
-  logAction(`set ${name}=${value}`)
-  if (DRY_RUN) return
-  try {
-    gh(['api', '-X', 'PATCH', `repos/${REPO}/actions/variables/${name}`, '-f', `value=${value}`])
-  } catch {
-    gh(['api', '-X', 'POST', `repos/${REPO}/actions/variables`, '-f', `name=${name}`, '-f', `value=${value}`])
-  }
-}
-
-function deleteVar(name) {
-  logAction(`delete variable ${name}`)
-  if (DRY_RUN) return
-  try {
-    gh(['api', '-X', 'DELETE', `repos/${REPO}/actions/variables/${name}`])
-  } catch {
-    // already absent -- fine
-  }
-}
-
-function clearQueueState() {
-  deleteVar('MERGE_QUEUE_PR')
-  deleteVar('MERGE_QUEUE_SHA')
-  deleteVar('MERGE_QUEUE_CLAIMED_AT')
-}
+const { getVar, setVar, deleteVar, clearQueueState } = createQueueState({
+  repo: REPO,
+  processingLabel: PROCESSING_LABEL,
+  dryRun: DRY_RUN,
+  log,
+  logAction,
+  ghJson,
+  ghApiJson,
+})
 
 function readYieldCountsRaw() {
   return getVar('MERGE_QUEUE_YIELD_COUNTS')

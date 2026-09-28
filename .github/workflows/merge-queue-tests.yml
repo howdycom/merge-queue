@@ -26,5 +26,5 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Run priority ranking tests
-        run: node --test priority.test.mjs
+      - name: Run merge-queue tests
+        run: node --test priority.test.mjs state.test.mjs
