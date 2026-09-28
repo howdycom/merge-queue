@@ -1,6 +1,10 @@
-# workflows
+# merge-queue
 
-Shared, stack-agnostic GitHub Actions and reusable workflows used across Howdy repos (`astro-market`, `ai-matching-platform`, and others).
+Shared GitHub Actions for a single-flight merge queue, plus a few companion actions that have no repo-specific business logic. The GitHub repository name is `howdycom/merge-queue`. The previous name was `howdycom/workflows`; GitHub redirects that slug after the rename, and the examples below use the new one.
+
+Licensed under the [MIT License](LICENSE).
+
+Howdy repos (`astro-market`, `ai-matching-platform`, and others) were the first callers. The actions are written so another repository can call them without Howdy-specific code.
 
 This repo exists to centralize CI/CD mechanics that are duplicated across repos but carry no repo-specific business logic — Slack notifications, deploy-lock coordination, secret scanning, PR review scaffolding, etc. Anything tied to a specific stack (Terraform/GCP orchestration, Heroku/Docker app fan-out, Prisma/Alembic migrations) stays in its own repo.
 
@@ -9,7 +13,7 @@ This repo exists to centralize CI/CD mechanics that are duplicated across repos 
 Reference actions and workflows by tag, not by branch:
 
 ```yaml
-- uses: howdycom/workflows/actions/slack-notification@v1
+- uses: howdycom/merge-queue/actions/slack-notification@v1
   with:
     status: success
     environment: production
@@ -53,11 +57,11 @@ on:
 
 jobs:
   process:
-    uses: howdycom/workflows/.github/workflows/merge-queue.yml@v1
+    uses: howdycom/merge-queue/.github/workflows/merge-queue.yml@v1
     with:
       target_branch: develop
       # Ordered focus list — first label is highest priority. Keep
-      # product-specific names here, not in howdycom/workflows.
+      # product-specific names here, not in howdycom/merge-queue.
       # Comma-separated or a YAML block both work:
       #   tier1_labels: |
       #     bug
@@ -109,7 +113,7 @@ A PR gets the `ready to merge` label once it's approved and green. From there it
 | `workflow_run` `completed` | `check-completion` | Only if `workflow_run.head_sha == MERGE_QUEUE_SHA` — every other firing is skipped before a runner is allocated (free). On match: fail → evict; cancelled → bounded re-run; BEHIND → re-sync; review blocks merge → evict/soft-requeue; else ensure auto-merge |
 | `schedule` | `watchdog` | Always evaluates: maintain in-flight / soft-requeue / evict / idle dequeue |
 
-> **Caller-side event filters (cross-repo coupling).** Consumers may add a job-level `if:` on the *caller* workflow (before `uses: howdycom/workflows/...`) so non-queue-affecting events never enter the reusable workflow at all — e.g. astro-market skips draft `pull_request`s and only forwards `synchronize`/`closed` when the PR is the current `MERGE_QUEUE_PR` claim ([astro-market `.github/workflows/merge-queue.yml`](https://github.com/howdycom/astro-market/blob/develop/.github/workflows/merge-queue.yml)). That filter drops events *before this reusable workflow runs*, so the table above only sees what the caller lets through. If you change a job `if:` here **or** a consumer pre-filter, keep both sides aligned: a mismatch fails silently (queue stops reacting; no Actions error). Document any consumer pre-filter next to its `if:` with a pointer back to this section.
+> **Caller-side event filters (cross-repo coupling).** Consumers may add a job-level `if:` on the *caller* workflow (before `uses: howdycom/merge-queue/...`) so non-queue-affecting events never enter the reusable workflow at all — e.g. astro-market skips draft `pull_request`s and only forwards `synchronize`/`closed` when the PR is the current `MERGE_QUEUE_PR` claim ([astro-market `.github/workflows/merge-queue.yml`](https://github.com/howdycom/astro-market/blob/develop/.github/workflows/merge-queue.yml)). That filter drops events *before this reusable workflow runs*, so the table above only sees what the caller lets through. If you change a job `if:` here **or** a consumer pre-filter, keep both sides aligned: a mismatch fails silently (queue stops reacting; no Actions error). Document any consumer pre-filter next to its `if:` with a pointer back to this section.
 
 **Label lifecycle:**
 
@@ -130,7 +134,7 @@ Check/set these up before wiring in the caller workflow above:
 3. **`target_branch` needs required status checks configured** in its branch protection — that's what auto-merge is actually waiting on. Check via `gh api repos/{owner}/{repo}/branches/{branch}/protection`.
    **Warning — do not combine this queue with "Dismiss stale pull request approvals when new commits are pushed."** The queue's own `update-branch` pushes a merge commit to every PR it claims; with dismiss-stale on, that push dismisses the very approval the merge needs, the review-state guard sees `REVIEW_REQUIRED`, soft-requeues the PR, and moves on to do the same to the next one — the queue would methodically un-approve your entire ready list (one wasted CI cycle and one bot comment per PR) and then idle. astro-market runs with `dismiss_stale_reviews: false`; verify yours before going live.
 4. **Caller `permissions:`** must grant `contents: write` (update-branch plus the `merge-queue-state` JSON file), `pull-requests: write`, `issues: write` (label mutations use Issues REST), `actions: write` (cancelled-check re-run), `checks: read`, and `statuses: read`. Do not pass a secret named `github_token` — that name is reserved by GitHub and fails workflow validation. `secrets.merge_queue_pat` is optional; omit it and jobs use `github.token`.
-5. **`Settings → Actions → General → Access`** on *this* repo (`howdycom/workflows`) must allow the consumer's org/repo to use its reusable workflows — otherwise every run fails with a generic "workflow file issue" and zero jobs, regardless of anything correct in the consumer's own file.
+5. **While this repository is private**, `Settings → Actions → General → Access` on `howdycom/merge-queue` must allow the consumer's org or repo to use its reusable workflows. Otherwise every run fails with a generic "workflow file issue" and zero jobs. After the repository is public, outside callers can use the workflow without that allow-list.
 
 ### Security notes for merge-queue consumers
 
