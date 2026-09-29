@@ -1,4 +1,4 @@
-# merge-queue
+# Howdy Merge Queue
 
 Shared GitHub Actions for a single-flight merge queue, plus a few companion actions that have no repo-specific business logic. The GitHub repository name is `howdycom/merge-queue`. The previous name was `howdycom/workflows`; GitHub redirects that slug after the rename, and the examples below use the new one.
 
