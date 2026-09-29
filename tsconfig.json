@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "compilerOptions": {
+    // The actions run straight from source on the runner (`node queue.ts`) via
+    // Node's type stripping, so there is no emit step: `npm run build` is a
+    // typecheck only, and every file must stick to erasable syntax (no enums,
+    // namespaces, or other runtime-emitted TypeScript).
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "allowImportingTsExtensions": true,
+    "strict": true,
+    "noEmit": true,
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "types": ["node"]
+  },
+  "include": ["actions/merge-queue/**/*.ts", "actions/claude-remediation-prepare/**/*.ts"]
+}

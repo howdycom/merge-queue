@@ -1,4 +1,4 @@
-import { errorText } from './errors.mjs'
+import { errorText } from './errors.ts'
 
 // Queue coordination state stored as a JSON file on a dedicated branch.
 // GITHUB_TOKEN can write repository contents (contents: write) but cannot
@@ -8,6 +8,33 @@ export const STATE_PATH = 'state.json'
 
 const CLAIM_KEYS = ['MERGE_QUEUE_PR', 'MERGE_QUEUE_SHA', 'MERGE_QUEUE_CLAIMED_AT']
 
+export interface QueueStateDeps {
+  repo: string
+  processingLabel: string
+  dryRun: boolean
+  log: (message: string) => void
+  logAction: (message: string) => void
+  ghJson: (args: string[]) => unknown
+  ghApiJson: (method: string, endpoint: string, body: unknown) => string
+}
+
+interface ContentFile {
+  sha: string
+  content: string
+}
+
+interface ProcessingIssue {
+  number: number
+  pull_request?: unknown
+}
+
+interface WriteFileBody {
+  message: string
+  content: string
+  branch: string
+  sha?: string
+}
+
 export function createQueueState({
   repo,
   processingLabel,
@@ -16,18 +43,27 @@ export function createQueueState({
   logAction,
   ghJson,
   ghApiJson,
-}) {
-  let cache = null
-  let blobSha = null
+}: QueueStateDeps) {
+  // Starts empty but is never observed before load() sets it: every reader
+  // and writer below goes through load() first.
+  let cache: Record<string, string> = {}
+  let blobSha: string | null = null
   let loaded = false
 
-  function emptyState() {
+  // `gh` JSON is untyped at the boundary; each call site below asserts the
+  // shape it asked for. The single cast lives here so the rest of the
+  // module stays branch-identical to the logic it implements.
+  function read<T = unknown>(args: string[]): T {
+    return ghJson(args) as T
+  }
+
+  function emptyState(): Record<string, string> {
     return {}
   }
 
-  function ensureBranch() {
+  function ensureBranch(): void {
     try {
-      ghJson(['api', `repos/${repo}/git/ref/heads/${STATE_BRANCH}`])
+      read(['api', `repos/${repo}/git/ref/heads/${STATE_BRANCH}`])
       return
     } catch (err) {
       const message = errorText(err)
@@ -35,8 +71,8 @@ export function createQueueState({
         throw err
       }
     }
-    const defaultBranch = ghJson(['api', `repos/${repo}`]).default_branch
-    const sha = ghJson(['api', `repos/${repo}/git/ref/heads/${defaultBranch}`]).object.sha
+    const defaultBranch = read<{ default_branch: string }>(['api', `repos/${repo}`]).default_branch
+    const sha = read<{ object: { sha: string } }>(['api', `repos/${repo}/git/ref/heads/${defaultBranch}`]).object.sha
     logAction(`create branch ${STATE_BRANCH}`)
     ghApiJson('POST', `repos/${repo}/git/refs`, {
       ref: `refs/heads/${STATE_BRANCH}`,
@@ -44,9 +80,9 @@ export function createQueueState({
     })
   }
 
-  function readFile() {
+  function readFile(): ContentFile | null {
     try {
-      return ghJson(['api', `repos/${repo}/contents/${STATE_PATH}?ref=${STATE_BRANCH}`])
+      return read<ContentFile>(['api', `repos/${repo}/contents/${STATE_PATH}?ref=${STATE_BRANCH}`])
     } catch (err) {
       const message = errorText(err)
       if (/404|Not Found/.test(message)) return null
@@ -54,17 +90,17 @@ export function createQueueState({
     }
   }
 
-  function migrateFromProcessingLabel() {
+  function migrateFromProcessingLabel(): Record<string, string> {
     if (!processingLabel) return emptyState()
     try {
-      const issues = ghJson([
+      const issues = read<ProcessingIssue[]>([
         'api',
         `repos/${repo}/issues?labels=${encodeURIComponent(processingLabel)}&state=open&per_page=5`,
       ])
       const prs = (Array.isArray(issues) ? issues : []).filter((issue) => issue.pull_request)
       if (prs.length !== 1) return emptyState()
       const number = String(prs[0].number)
-      const view = ghJson(['pr', 'view', number, '--repo', repo, '--json', 'headRefOid'])
+      const view = read<{ headRefOid?: string }>(['pr', 'view', number, '--repo', repo, '--json', 'headRefOid'])
       log(
         `Migrating merge-queue state from ${processingLabel} on PR #${number} (no ${STATE_PATH} on ${STATE_BRANCH} yet).`,
       )
@@ -81,7 +117,7 @@ export function createQueueState({
     }
   }
 
-  function load() {
+  function load(): void {
     if (loaded) return
     loaded = true
     try {
@@ -103,9 +139,9 @@ export function createQueueState({
     if (Object.keys(cache).length > 0 && !dryRun) flush()
   }
 
-  function flush() {
+  function flush(): void {
     ensureBranch()
-    const body = {
+    const body: WriteFileBody = {
       message: 'merge-queue: update coordination state',
       content: Buffer.from(`${JSON.stringify(cache, null, 2)}\n`).toString('base64'),
       branch: STATE_BRANCH,
@@ -119,7 +155,7 @@ export function createQueueState({
       if (/409|sha/.test(message)) {
         const latest = readFile()
         blobSha = latest?.sha || null
-        const retry = {
+        const retry: WriteFileBody = {
           message: 'merge-queue: update coordination state',
           content: Buffer.from(`${JSON.stringify(cache, null, 2)}\n`).toString('base64'),
           branch: STATE_BRANCH,
@@ -133,33 +169,33 @@ export function createQueueState({
     }
   }
 
-  function getVar(name) {
+  function getVar(name: string): string {
     load()
     return cache[name] || ''
   }
 
-  function setVar(name, value) {
+  function setVar(name: string, value: string): void {
     load()
     logAction(`set ${name}=${value}`)
     cache[name] = value
     if (!dryRun) flush()
   }
 
-  function deleteVar(name) {
+  function deleteVar(name: string): void {
     load()
     if (!(name in cache)) {
       logAction(`delete variable ${name}`)
       return
     }
     logAction(`delete variable ${name}`)
-    // Dry-run must not forget the claim. queue.mjs relies on that so a
+    // Dry-run must not forget the claim. queue.ts relies on that so a
     // chained dequeue stops instead of replaying the same decision.
     if (dryRun) return
     delete cache[name]
     flush()
   }
 
-  function clearQueueState() {
+  function clearQueueState(): void {
     for (const key of CLAIM_KEYS) deleteVar(key)
   }
 

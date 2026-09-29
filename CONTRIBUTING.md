@@ -2,12 +2,16 @@
 
 ## Tests
 
-Merge-queue logic is plain Node, with no install:
+Merge-queue logic is TypeScript that runs directly on plain Node via type
+stripping, with no install and no build step:
 
 ```bash
 cd actions/merge-queue
-node --test priority.test.mjs state.test.mjs
+node --test priority.test.ts state.test.ts
 ```
+
+`npm run build` is a typecheck (`tsc --noEmit`); `npm test` runs the full
+suite with the 100% coverage gate.
 
 Project board sync tests live under `actions/project-sync/tests`.
 

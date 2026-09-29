@@ -2,16 +2,33 @@
 // Consumer repos pass the label list; this module never hardcodes
 // product-specific names beyond the documented defaults.
 
+export interface TieredPr {
+  title?: string
+  labels?: Array<string | { name?: string }>
+  author?: string | { login?: string }
+}
+
+export interface ClassifyTierOptions {
+  labels: string[]
+  tier1TitleRegex: RegExp
+  tier2TitleRegex: RegExp
+  deprioritizedTitleRegex?: RegExp | null
+  deprioritizedAuthors?: string[] | null
+}
+
+export interface QueueItem {
+  tier: number
+  yieldCount?: number
+  createdAt?: string
+  number?: number
+}
+
 /**
  * Parse a comma- or newline-separated label list.
  * Empty tokens are dropped. `raw` falling back to `fallback` when blank
  * keeps callers that omit the input on the documented default.
- *
- * @param {string | undefined | null} raw
- * @param {string} [fallback]
- * @returns {string[]}
  */
-export function parseLabelList(raw, fallback = '') {
+export function parseLabelList(raw: string | undefined | null, fallback: string | null = ''): string[] {
   const source = raw == null || String(raw).trim() === '' ? String(fallback ?? '') : String(raw)
   return source
     .split(/[,\n]/)
@@ -22,11 +39,8 @@ export function parseLabelList(raw, fallback = '') {
 /**
  * Canonical author login for deprioritization matching.
  * `app/dependabot`, `dependabot[bot]`, and `Dependabot` all become `dependabot`.
- *
- * @param {string | { login?: string } | undefined | null} value
- * @returns {string}
  */
-export function normalizeAuthor(value) {
+export function normalizeAuthor(value: string | { login?: string } | undefined | null): string {
   const login = typeof value === 'string' ? value : value?.login || ''
   let normalized = String(login).trim().toLowerCase()
   if (normalized.startsWith('app/')) normalized = normalized.slice(4)
@@ -49,31 +63,17 @@ export function normalizeAuthor(value) {
  * A PR that carries several configured labels uses the earliest
  * (highest-priority) match. Title-based HOTFIX stays at rank 1 so
  * emergencies still jump the queue without a focus label.
- *
- * @param {{
- *   title?: string,
- *   labels?: Array<string | { name?: string }>,
- *   author?: string | { login?: string },
- * }} pr
- * @param {{
- *   labels: string[],
- *   tier1TitleRegex: RegExp,
- *   tier2TitleRegex: RegExp,
- *   deprioritizedTitleRegex?: RegExp | null,
- *   deprioritizedAuthors?: string[],
- * }} options
- * @returns {number}
  */
 export function classifyTier(
-  pr,
+  pr: TieredPr,
   {
     labels,
     tier1TitleRegex,
     tier2TitleRegex,
     deprioritizedTitleRegex = null,
     deprioritizedAuthors = [],
-  },
-) {
+  }: ClassifyTierOptions,
+): number {
   const focusCount = Math.max(labels.length, 1)
   const issueRank = focusCount + 1
   const otherRank = focusCount + 2
@@ -102,7 +102,7 @@ export function classifyTier(
   return otherRank
 }
 
-function matches(regex, text) {
+function matches(regex: RegExp | null, text: string): boolean {
   if (!regex) return false
   regex.lastIndex = 0
   return regex.test(text)
@@ -111,13 +111,10 @@ function matches(regex, text) {
 /**
  * How many times a PR has already yielded via soft-requeue. Missing,
  * non-finite, and negative values sort as 0 (never yielded).
- *
- * @param {{ yieldCount?: number }} item
- * @returns {number}
  */
-function yieldCountOf(item) {
+function yieldCountOf(item: QueueItem): number {
   const n = item.yieldCount
-  return Number.isFinite(n) && n > 0 ? n : 0
+  return typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : 0
 }
 
 /**
@@ -126,12 +123,8 @@ function yieldCountOf(item) {
  * has already soft-requeued sorts behind peers it has blocked, then
  * oldest PR first (`createdAt`, then number). Label-applied time is
  * not part of the order — yield count is what demotes a stuck PR.
- *
- * @param {{ tier: number, yieldCount?: number, createdAt?: string, number?: number }} a
- * @param {{ tier: number, yieldCount?: number, createdAt?: string, number?: number }} b
- * @returns {number}
  */
-export function compareQueueItems(a, b) {
+export function compareQueueItems(a: QueueItem, b: QueueItem): number {
   if (a.tier !== b.tier) return a.tier - b.tier
   const aYield = yieldCountOf(a)
   const bYield = yieldCountOf(b)
@@ -149,12 +142,9 @@ export function compareQueueItems(a, b) {
  * Persist yield counts as `prNumber:count` pairs, comma-separated
  * (`123:1,456:2`). Stored in the MERGE_QUEUE_YIELD_COUNTS Actions
  * variable so a later dequeue can demote a PR that already yielded.
- *
- * @param {string | undefined | null} raw
- * @returns {Record<string, number>}
  */
-export function parseYieldCounts(raw) {
-  const counts = {}
+export function parseYieldCounts(raw: string | undefined | null): Record<string, number> {
+  const counts: Record<string, number> = {}
   if (raw == null || String(raw).trim() === '') return counts
   for (const token of String(raw).split(',')) {
     const trimmed = token.trim()
@@ -169,11 +159,7 @@ export function parseYieldCounts(raw) {
   return counts
 }
 
-/**
- * @param {Record<string, number>} counts
- * @returns {string}
- */
-export function serializeYieldCounts(counts) {
+export function serializeYieldCounts(counts: Record<string, number>): string {
   return Object.entries(counts)
     .filter(([, n]) => Number.isFinite(n) && n > 0)
     .sort(([a], [b]) => Number(a) - Number(b) || a.localeCompare(b))
@@ -181,12 +167,7 @@ export function serializeYieldCounts(counts) {
     .join(',')
 }
 
-/**
- * @param {string | undefined | null} raw
- * @param {string | number} prNumber
- * @returns {string}
- */
-export function incrementYieldCount(raw, prNumber) {
+export function incrementYieldCount(raw: string | undefined | null, prNumber: string | number): string {
   if (prNumber == null || String(prNumber).trim() === '') {
     return serializeYieldCounts(parseYieldCounts(raw))
   }
@@ -196,12 +177,7 @@ export function incrementYieldCount(raw, prNumber) {
   return serializeYieldCounts(counts)
 }
 
-/**
- * @param {string | undefined | null} raw
- * @param {string | number} prNumber
- * @returns {string}
- */
-export function dropYieldCount(raw, prNumber) {
+export function dropYieldCount(raw: string | undefined | null, prNumber: string | number): string {
   const counts = parseYieldCounts(raw)
   delete counts[String(prNumber)]
   return serializeYieldCounts(counts)
@@ -211,12 +187,8 @@ export function dropYieldCount(raw, prNumber) {
  * Keep counts only for PRs still in `prNumbers` (plus any extra keys
  * the caller wants preserved, e.g. a just-requeued PR the search index
  * has not yet returned).
- *
- * @param {string | undefined | null} raw
- * @param {Iterable<string | number>} prNumbers
- * @returns {string}
  */
-export function pruneYieldCounts(raw, prNumbers) {
+export function pruneYieldCounts(raw: string | undefined | null, prNumbers: Iterable<string | number>): string {
   const counts = parseYieldCounts(raw)
   const keep = new Set([...prNumbers].map(String))
   for (const key of Object.keys(counts)) {

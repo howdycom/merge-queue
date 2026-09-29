@@ -10,7 +10,8 @@ import {
   parseYieldCounts,
   pruneYieldCounts,
   serializeYieldCounts,
-} from './priority.mjs'
+  type TieredPr,
+} from './priority.ts'
 
 const HOTFIX = /^\[HOTFIX\]/i
 const HCP = /^\[HCP-/i
@@ -21,13 +22,19 @@ const DEFAULT_LABELS = parseLabelList('bug')
 const FOCUS_LABELS = parseLabelList('bug, workspace')
 const ONBOARDING_LABELS = parseLabelList('bug, workspace, app-onboarding, onboarding')
 
-function pr(title, labels, author) {
-  const item = { title, labels: labels.map((name) => ({ name })) }
+function pr(title: string, labels: string[], author?: string | { login: string }): TieredPr {
+  const item: TieredPr = { title, labels: labels.map((name) => ({ name })) }
   if (author !== undefined) item.author = author
   return item
 }
 
-function rank(item, labels = DEFAULT_LABELS, extra = {}) {
+interface RankExtra {
+  tier2TitleRegex?: RegExp
+  deprioritizedTitleRegex?: RegExp | null
+  deprioritizedAuthors?: string[] | null
+}
+
+function rank(item: TieredPr, labels: string[] = DEFAULT_LABELS, extra: RankExtra = {}): number {
   return classifyTier(item, {
     labels,
     tier1TitleRegex: HOTFIX,
@@ -37,7 +44,7 @@ function rank(item, labels = DEFAULT_LABELS, extra = {}) {
   })
 }
 
-function fullRank(item, labels = ONBOARDING_LABELS) {
+function fullRank(item: TieredPr, labels: string[] = ONBOARDING_LABELS): number {
   return rank(item, labels, {
     tier2TitleRegex: ISSUE,
     deprioritizedTitleRegex: TECH,
@@ -132,7 +139,7 @@ describe('classifyTier — ordered focus labels', () => {
 
 describe('classifyTier — empty label list still ranks by title', () => {
   it('uses HOTFIX then HCP then everything else', () => {
-    const none = []
+    const none: string[] = []
     assert.equal(rank(pr('[HOTFIX] now', []), none), 1)
     assert.equal(rank(pr('[HCP-1] later', []), none), 2)
     assert.equal(rank(pr('[TECH] last', []), none), 3)
@@ -312,6 +319,16 @@ describe('compareQueueItems — oldest PR first within a tier', () => {
     assert.deepEqual(
       ordered.map((item) => item.number),
       [80, 40],
+    )
+  })
+
+  it('treats a non-finite yieldCount as 0 so corrupt counts never demote', () => {
+    const corrupt = { tier: 2, createdAt: '2026-01-01T00:00:00Z', number: 10, yieldCount: Number.NaN }
+    const yielded = { tier: 2, createdAt: '2026-06-01T00:00:00Z', number: 20, yieldCount: 1 }
+    const ordered = [yielded, corrupt].sort(compareQueueItems)
+    assert.deepEqual(
+      ordered.map((item) => item.number),
+      [10, 20],
     )
   })
 })

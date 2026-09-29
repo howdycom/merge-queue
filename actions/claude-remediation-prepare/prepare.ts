@@ -6,6 +6,67 @@ import { execFileSync } from 'node:child_process'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 
+// `gh` JSON is untyped at the boundary: ghJson<T> asserts the shape each
+// call site asked for, so the interfaces below mirror the `--json` field
+// lists, not validated schemas.
+interface GhTriggerUser {
+  login?: string
+}
+
+interface GhTriggerComment {
+  id?: number
+  body?: string
+  user?: GhTriggerUser
+  html_url?: string
+  diff_hunk?: string
+  line?: number
+  path?: string
+  in_reply_to_id?: number
+  start_line?: number
+}
+
+interface GhTriggerEvent {
+  comment?: GhTriggerComment
+  issue?: { number?: number; pull_request?: unknown }
+  pull_request?: { number?: number }
+}
+
+interface ReviewCommentRef {
+  body: string
+  diffHunk?: string
+  line?: number
+  path?: string
+  replyToCommentId?: number
+  startLine?: number
+  url: string
+}
+
+interface RemediationTrigger {
+  actor: string
+  commentBody: string
+  commentId: number
+  commentUrl: string
+  eventName: string
+  prNumber: number
+  scope: string
+  reviewComment?: ReviewCommentRef
+}
+
+interface RemediationPr {
+  author?: unknown
+  baseRefName?: string
+  headRefName: string
+  headRefOid: string
+  headRepository?: unknown
+  headRepositoryOwner?: { login?: string }
+  isCrossRepository?: boolean
+  isDraft?: boolean
+  number: number
+  title: string
+  url: string
+  files?: Array<{ path?: string }>
+}
+
 const CONTEXT_DIR_NAME = 'claude-remediation'
 const WRITABLE_PERMISSIONS = new Set(['admin', 'maintain', 'write'])
 
@@ -45,7 +106,7 @@ const SENSITIVE_FILE_NAMES = new Set(
     .filter(Boolean),
 )
 
-function ghText(args) {
+function ghText(args: string[]): string {
   return execFileSync('gh', args, {
     encoding: 'utf-8',
     env: { ...process.env },
@@ -53,45 +114,45 @@ function ghText(args) {
   }).trim()
 }
 
-function ghJson(args) {
+function ghJson<T = unknown>(args: string[]): T {
   return JSON.parse(ghText(args))
 }
 
-function ghPaginatedJson(endpoint) {
-  const pages = ghJson(['api', '--paginate', '--slurp', endpoint])
+function ghPaginatedJson<T = unknown>(endpoint: string): T[] {
+  const pages = ghJson<T[][]>(['api', '--paginate', '--slurp', endpoint])
   return pages.flat()
 }
 
-function writeOutput(name, value) {
+function writeOutput(name: string, value: string | number | undefined): void {
   const outputPath = process.env.GITHUB_OUTPUT
   if (!outputPath) return
   fs.appendFileSync(outputPath, `${name}=${String(value).replace(/\n/g, ' ')}\n`)
 }
 
-function writeDisabled(reason, prNumber) {
+function writeDisabled(reason: string, prNumber?: number): void {
   writeOutput('enabled', 'false')
   writeOutput('skip_reason', reason)
   if (prNumber) writeOutput('pr_number', prNumber)
   console.log(reason)
 }
 
-function ensureEnv(name) {
+function ensureEnv(name: string): string {
   const value = process.env[name]
   if (!value) throw new Error(`Missing required environment variable: ${name}`)
   return value
 }
 
-function getContextDir() {
+function getContextDir(): string {
   const root =
     process.env.CLAUDE_REMEDIATION_CONTEXT_DIR || process.env.RUNNER_TEMP || process.cwd()
   return path.join(root, CONTEXT_DIR_NAME)
 }
 
-function writeJson(filePath, value) {
+function writeJson(filePath: string, value: unknown): void {
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`)
 }
 
-function getCollaboratorPermission(repository, actor) {
+function getCollaboratorPermission(repository: string, actor: string): string | undefined {
   try {
     return ghText(['api', `repos/${repository}/collaborators/${actor}/permission`, '--jq', '.permission'])
   } catch {
@@ -99,15 +160,15 @@ function getCollaboratorPermission(repository, actor) {
   }
 }
 
-function isWritablePermission(permission) {
+function isWritablePermission(permission: string | undefined): boolean {
   return Boolean(permission && WRITABLE_PERMISSIONS.has(permission))
 }
 
-function isProtectedHeadBranch(branchName) {
+function isProtectedHeadBranch(branchName: string): boolean {
   return PROTECTED_BRANCHES.has(branchName)
 }
 
-function touchesSensitivePaths(files) {
+function touchesSensitivePaths(files: Array<{ path?: string }>): boolean {
   return files.some((entry) => {
     const filePath = String(entry?.path || '')
     if (SENSITIVE_PATH_PREFIXES.some((prefix) => filePath.startsWith(prefix))) return true
@@ -115,11 +176,11 @@ function touchesSensitivePaths(files) {
   })
 }
 
-function buildRemediationBranch(prNumber, runId, runAttempt) {
+function buildRemediationBranch(prNumber: number, runId: string, runAttempt: string): string {
   return `claude/remediate-pr-${prNumber}-${runId}-${runAttempt}`
 }
 
-function parseRemediationCommand(body) {
+function parseRemediationCommand(body: string | undefined): { raw: string; scope: string } | null {
   const firstLine = body
     ?.replace(/\r\n/g, '\n')
     .split('\n')
@@ -141,7 +202,7 @@ function parseRemediationCommand(body) {
   return null
 }
 
-function resolveTrigger(eventName, event) {
+function resolveTrigger(eventName: string, event: GhTriggerEvent): RemediationTrigger | null {
   const commentBody = event.comment?.body
   const command = parseRemediationCommand(commentBody)
 
@@ -197,25 +258,25 @@ function resolveTrigger(eventName, event) {
   return null
 }
 
-function getReviewCommentId(comment) {
+function getReviewCommentId(comment: unknown): number | undefined {
   if (!comment || typeof comment !== 'object' || !('id' in comment)) return undefined
-  const id = comment.id
+  const id: unknown = comment.id
   return typeof id === 'number' ? id : undefined
 }
 
-function findTargetReviewComment(reviewComments, targetReviewCommentId) {
+function findTargetReviewComment(reviewComments: unknown[], targetReviewCommentId: number | undefined): unknown {
   if (targetReviewCommentId === undefined) return undefined
   return reviewComments.find((comment) => getReviewCommentId(comment) === targetReviewCommentId)
 }
 
-async function prepare() {
+async function prepare(): Promise<void> {
   const eventName = ensureEnv('GITHUB_EVENT_NAME')
   const eventPath = ensureEnv('GITHUB_EVENT_PATH')
   const repository = ensureEnv('GITHUB_REPOSITORY')
   const runId = ensureEnv('GITHUB_RUN_ID')
   const runAttempt = ensureEnv('GITHUB_RUN_ATTEMPT')
   const [repoOwner] = repository.split('/')
-  const event = JSON.parse(fs.readFileSync(eventPath, 'utf-8'))
+  const event: GhTriggerEvent = JSON.parse(fs.readFileSync(eventPath, 'utf-8'))
   const trigger = resolveTrigger(eventName, event)
 
   if (!trigger) {
@@ -233,7 +294,7 @@ async function prepare() {
     return
   }
 
-  const pr = ghJson([
+  const pr = ghJson<RemediationPr>([
     'pr',
     'view',
     String(trigger.prNumber),

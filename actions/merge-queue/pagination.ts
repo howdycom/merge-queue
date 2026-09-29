@@ -1,9 +1,9 @@
 // Query-string helpers and REST list pagination for `gh api`.
-// Split out of queue.mjs so both "endpoint already has per_page" and
-// "caller omitted per_page" are reachable in unit tests. queue.mjs always
+// Split out of queue.ts so both "endpoint already has per_page" and
+// "caller omitted per_page" are reachable in unit tests. queue.ts always
 // passes a per_page, which would leave the other branch uncovered.
 
-export function appendQueryParam(endpoint, key, value) {
+export function appendQueryParam(endpoint: string, key: string, value: string): string {
   // Drop any existing occurrence of the key so page= can be set cleanly.
   const withoutKey = endpoint
     .replace(new RegExp(`([?&])${key}=[^&]*&?`), '$1')
@@ -12,9 +12,14 @@ export function appendQueryParam(endpoint, key, value) {
   return `${withoutKey}${sep}${key}=${encodeURIComponent(value)}`
 }
 
-export function getQueryParam(endpoint, key) {
+export function getQueryParam(endpoint: string, key: string): string | null {
   const match = endpoint.match(new RegExp(`[?&]${key}=([^&]*)`))
   return match ? decodeURIComponent(match[1]) : null
+}
+
+export interface PaginateDeps {
+  ghJson: (args: string[]) => unknown
+  supportsSlurp: boolean
 }
 
 /**
@@ -22,12 +27,12 @@ export function getQueryParam(endpoint, key) {
  * `supportsSlurp` selects `gh api --paginate --slurp` (gh >= ~2.48).
  * Otherwise page= is walked explicitly so older gh still works.
  *
- * @param {string} endpoint
- * @param {{ ghJson: (args: string[]) => unknown, supportsSlurp: boolean }} deps
+ * A non-array page is returned unchanged (never wrapped), so the result is
+ * `unknown` and each caller asserts the shape it asked `gh` for.
  */
-export function paginate(endpoint, { ghJson, supportsSlurp }) {
+export function paginate(endpoint: string, { ghJson, supportsSlurp }: PaginateDeps): unknown {
   if (supportsSlurp) {
-    const pages = ghJson(['api', '--paginate', '--slurp', endpoint])
+    const pages: unknown = ghJson(['api', '--paginate', '--slurp', endpoint])
     return Array.isArray(pages) ? pages.flat() : pages
   }
 
@@ -40,10 +45,10 @@ export function paginate(endpoint, { ghJson, supportsSlurp }) {
     .replace(new RegExp(`([?&])page=[^&]*&?`), '$1')
     .replace(/[?&]$/, '')
 
-  const items = []
+  const items: unknown[] = []
   const maxPages = 100
   for (let page = 1; page <= maxPages; page += 1) {
-    const batch = ghJson(['api', appendQueryParam(base, 'page', String(page))])
+    const batch: unknown = ghJson(['api', appendQueryParam(base, 'page', String(page))])
     if (!Array.isArray(batch)) return batch
     items.push(...batch)
     if (batch.length < perPage) break

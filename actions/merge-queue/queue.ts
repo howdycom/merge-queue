@@ -44,8 +44,8 @@
 //                                 human re-queue starts at 0; pruned on
 //                                 dequeue for PRs no longer in the ready list.
 import { execFileSync } from 'node:child_process'
-import { errorText } from './errors.mjs'
-import { paginate } from './pagination.mjs'
+import { errorText } from './errors.ts'
+import { paginate } from './pagination.ts'
 import {
   classifyTier as rankPullRequest,
   compareQueueItems,
@@ -55,8 +55,58 @@ import {
   parseYieldCounts,
   pruneYieldCounts,
   serializeYieldCounts,
-} from './priority.mjs'
-import { createQueueState } from './state.mjs'
+  type TieredPr,
+} from './priority.ts'
+import { createQueueState } from './state.ts'
+
+// `gh` JSON is untyped at the boundary: ghJson<T> asserts the shape each
+// call site asked for (see state.ts's read<T> for the same pattern), so the
+// interfaces below mirror the `--json` field lists, not validated schemas.
+type PrNumber = string | number
+
+interface GhLabel {
+  name: string
+}
+
+interface GhPrListItem {
+  number: number
+  title: string
+  labels: Array<{ name: string }>
+  createdAt: string
+  isDraft: boolean
+  reviewDecision?: string
+  author: { login: string }
+}
+
+interface PrSnapshot {
+  state: string
+  mergeable: string
+  mergeStateStatus: string
+  headRefOid: string
+  labels?: GhLabel[]
+  autoMergeRequest?: { enabledBy?: string } | null
+  title: string
+  reviewDecision?: string
+  isDraft: boolean
+}
+
+interface PrStatus {
+  mergeStateStatus: string
+  headRefOid: string
+  autoMergeRequest: { enabledBy?: string } | null
+}
+
+interface GhCheck {
+  name: string
+  bucket: string
+  link?: string
+}
+
+interface TimelineEvent {
+  event: string
+  label?: { name?: string }
+  created_at?: string
+}
 
 const REPO = requireEnv('GITHUB_REPOSITORY')
 const COMMAND = requireEnv('MQ_COMMAND')
@@ -125,22 +175,22 @@ const MAX_CHECK_RERUN_ATTEMPTS = 2
 // no-op because the head is already current with the base.
 const ALREADY_UP_TO_DATE_RE = /up.to.date|not.*behind|no new commits on the base branch/i
 
-function requireEnv(name) {
+function requireEnv(name: string): string {
   const value = process.env[name]
   if (!value) throw new Error(`Missing required environment variable: ${name}`)
   return value
 }
 
-function sh(args, envOverride) {
+function sh(args: string[], envOverride?: Record<string, string | undefined>): string {
   const env = envOverride ? { ...process.env, ...envOverride } : process.env
   return execFileSync(args[0], args.slice(1), { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], env }).trim()
 }
 
-function gh(args) {
+function gh(args: string[]): string {
   return sh(['gh', ...args])
 }
 
-function ghJson(args) {
+function ghJson<T = unknown>(args: string[]): T {
   return JSON.parse(gh(args))
 }
 
@@ -153,7 +203,7 @@ function ghJson(args) {
 // `gh pr edit … --add-label merge-queue: processing` with
 //   GraphQL: Projects (classic) is being deprecated … (projectCards)
 // leaving MERGE_QUEUE_* variables set and the processing label never applied.
-function ghApiJson(method, endpoint, body) {
+function ghApiJson(method: string, endpoint: string, body: unknown): string {
   return execFileSync(
     'gh',
     ['api', '-X', method, endpoint, '--input', '-'],
@@ -177,7 +227,7 @@ function ghApiJson(method, endpoint, body) {
 // go through GH_TOKEN, which callers now pass as github.token. MQ_GITHUB_TOKEN
 // stays a distinct env var so check-run reads keep working if a caller still
 // supplies a PAT that cannot read other Apps' checks.
-function ghAsDefaultToken(args) {
+function ghAsDefaultToken(args: string[]): string {
   if (!process.env.MQ_GITHUB_TOKEN) {
     throw new Error(
       'MQ_GITHUB_TOKEN is not set -- the calling job needs `permissions: checks: read` for this to work (see check-completion).',
@@ -186,7 +236,7 @@ function ghAsDefaultToken(args) {
   return sh(['gh', ...args], { GH_TOKEN: process.env.MQ_GITHUB_TOKEN })
 }
 
-function ghJsonAsDefaultToken(args) {
+function ghJsonAsDefaultToken<T = unknown>(args: string[]): T {
   return JSON.parse(ghAsDefaultToken(args))
 }
 
@@ -196,8 +246,8 @@ function ghJsonAsDefaultToken(args) {
 // ("unknown flag: --slurp"), which previously crashed every dequeue/watchdog
 // call into getReadySince. Fall back to explicit page= iteration so the queue
 // keeps working on those fleets without requiring a runner image upgrade.
-let cachedGhApiSupportsSlurp
-function ghApiSupportsSlurp() {
+let cachedGhApiSupportsSlurp: boolean | undefined
+function ghApiSupportsSlurp(): boolean {
   if (cachedGhApiSupportsSlurp !== undefined) return cachedGhApiSupportsSlurp
   try {
     cachedGhApiSupportsSlurp = /\b--slurp\b/.test(sh(['gh', 'api', '--help']))
@@ -207,19 +257,19 @@ function ghApiSupportsSlurp() {
   return cachedGhApiSupportsSlurp
 }
 
-function ghPaginatedJson(endpoint) {
-  return paginate(endpoint, { ghJson, supportsSlurp: ghApiSupportsSlurp() })
+function ghPaginatedJson(endpoint: string): TimelineEvent[] {
+  return paginate(endpoint, { ghJson, supportsSlurp: ghApiSupportsSlurp() }) as TimelineEvent[]
 }
 
-function sleep(ms) {
+function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-function log(message) {
+function log(message: string): void {
   console.log(`[merge-queue:${COMMAND}] ${message}`)
 }
 
-function logAction(message) {
+function logAction(message: string): void {
   log(DRY_RUN ? `[dry-run] would ${message}` : message)
 }
 
@@ -235,24 +285,24 @@ const { getVar, setVar, deleteVar, clearQueueState } = createQueueState({
   ghApiJson,
 })
 
-function readYieldCountsRaw() {
+function readYieldCountsRaw(): string {
   return getVar('MERGE_QUEUE_YIELD_COUNTS')
 }
 
-function writeYieldCounts(serialized) {
+function writeYieldCounts(serialized: string): void {
   if (serialized) setVar('MERGE_QUEUE_YIELD_COUNTS', serialized)
   else deleteVar('MERGE_QUEUE_YIELD_COUNTS')
 }
 
-function bumpYieldCount(prNumber) {
+function bumpYieldCount(prNumber: PrNumber): void {
   writeYieldCounts(incrementYieldCount(readYieldCountsRaw(), prNumber))
 }
 
-function clearYieldCount(prNumber) {
+function clearYieldCount(prNumber: PrNumber): void {
   writeYieldCounts(dropYieldCount(readYieldCountsRaw(), prNumber))
 }
 
-function pruneStaleYieldCounts(prNumbers) {
+function pruneStaleYieldCounts(prNumbers: Iterable<string | number>): void {
   const raw = readYieldCountsRaw()
   const next = pruneYieldCounts(raw, prNumbers)
   if (next !== serializeYieldCounts(parseYieldCounts(raw))) writeYieldCounts(next)
@@ -260,7 +310,7 @@ function pruneStaleYieldCounts(prNumbers) {
 
 // ---- PR mutations ----
 
-function addLabel(prNumber, label) {
+function addLabel(prNumber: PrNumber, label: string): void {
   logAction(`add label "${label}" to PR #${prNumber}`)
   if (DRY_RUN) return
   // Issues REST, not `gh pr edit --add-label` — see ghApiJson comment.
@@ -268,7 +318,7 @@ function addLabel(prNumber, label) {
   ghApiJson('POST', `repos/${REPO}/issues/${prNumber}/labels`, { labels: [label] })
 }
 
-function removeLabel(prNumber, label) {
+function removeLabel(prNumber: PrNumber, label: string): void {
   logAction(`remove label "${label}" from PR #${prNumber}`)
   if (DRY_RUN) return
   try {
@@ -299,13 +349,13 @@ function removeLabel(prNumber, label) {
   }
 }
 
-function comment(prNumber, body) {
+function comment(prNumber: PrNumber, body: string): void {
   logAction(`comment on PR #${prNumber}: ${body.split('\n')[0]}`)
   if (DRY_RUN) return
   gh(['pr', 'comment', String(prNumber), '--body', body])
 }
 
-function enableAutoMerge(prNumber) {
+function enableAutoMerge(prNumber: PrNumber): void {
   // Enabled here rather than trusted as a precondition: a PR that's
   // ready-labeled but never actually had auto-merge turned on would sit
   // fully green and just never merge, jamming the queue until the watchdog
@@ -321,8 +371,8 @@ function enableAutoMerge(prNumber) {
   }
 }
 
-function viewPr(prNumber) {
-  return ghJson([
+function viewPr(prNumber: PrNumber): PrSnapshot {
+  return ghJson<PrSnapshot>([
     'pr',
     'view',
     String(prNumber),
@@ -331,16 +381,16 @@ function viewPr(prNumber) {
   ])
 }
 
-async function resolveMergeable(prNumber, initialMergeable) {
+async function resolveMergeable(prNumber: PrNumber, initialMergeable: string): Promise<string> {
   let mergeable = initialMergeable
   for (let attempt = 0; mergeable === 'UNKNOWN' && attempt < MERGEABLE_POLL_ATTEMPTS; attempt++) {
     await sleep(MERGEABLE_POLL_INTERVAL_MS)
-    mergeable = ghJson(['pr', 'view', String(prNumber), '--json', 'mergeable']).mergeable
+    mergeable = ghJson<{ mergeable: string }>(['pr', 'view', String(prNumber), '--json', 'mergeable']).mergeable
   }
   return mergeable
 }
 
-async function evict(prNumber, reason, depth = 0) {
+async function evict(prNumber: PrNumber, reason: string, depth = 0): Promise<void> {
   log(`Evicting PR #${prNumber}: ${reason}`)
   removeLabel(prNumber, READY_LABEL)
   removeLabel(prNumber, PROCESSING_LABEL)
@@ -375,7 +425,7 @@ async function evict(prNumber, reason, depth = 0) {
  * evict() when the PR is not at fault (slow checks, an approval that
  * disappeared) -- it keeps the ready label so no human has to re-queue it.
  */
-async function softRequeueToBack(prNumber, body, depth = 0) {
+async function softRequeueToBack(prNumber: PrNumber, body: string, depth = 0): Promise<void> {
   // Clear the claim BEFORE removing the ready label so the unlabeled
   // webhook's cleanup job sees no matching MERGE_QUEUE_PR and no-ops
   // (avoids a double-dequeue race with the explicit dequeue() below).
@@ -416,7 +466,7 @@ async function softRequeueToBack(prNumber, body, depth = 0) {
  * logged warning, claim kept, attempt still counted -- and the cap
  * eventually evicts with an accurate reason instead of looping forever.
  */
-async function rerunCancelledChecks(prNumber, cancelled) {
+async function rerunCancelledChecks(prNumber: PrNumber, cancelled: GhCheck[]): Promise<void> {
   const names = cancelled.map((c) => c.name).join(', ')
 
   // `gh pr checks --json link` returns the check's HTML URL, which embeds
@@ -442,10 +492,10 @@ async function rerunCancelledChecks(prNumber, cancelled) {
   // without this gate each trailing pass would burn one attempt on a
   // rerun-failed-jobs call GitHub is guaranteed to reject ("run in
   // progress"). Passes that start nothing do not count toward the cap.
-  const completedRunIds = []
+  const completedRunIds: string[] = []
   for (const runId of runIds) {
     try {
-      const status = ghJsonAsDefaultToken(['api', `repos/${REPO}/actions/runs/${runId}`]).status
+      const status = ghJsonAsDefaultToken<{ status: string }>(['api', `repos/${REPO}/actions/runs/${runId}`]).status
       if (status === 'completed') {
         completedRunIds.push(runId)
       } else {
@@ -513,7 +563,7 @@ async function rerunCancelledChecks(prNumber, cancelled) {
 
 // ---- priority classification ----
 
-function classifyTier(pr) {
+function classifyTier(pr: TieredPr): number {
   return rankPullRequest(pr, {
     labels: TIER1_LABELS,
     tier1TitleRegex: TIER1_TITLE_REGEX,
@@ -523,7 +573,7 @@ function classifyTier(pr) {
   })
 }
 
-function getReadySince(prNumber, fallback) {
+function getReadySince(prNumber: number, fallback: string): string | undefined {
   const events = ghPaginatedJson(`repos/${REPO}/issues/${prNumber}/timeline?per_page=100`)
   const labelEvents = events.filter(
     (e) => e.event === 'labeled' && e.label && e.label.name === READY_LABEL,
@@ -541,12 +591,12 @@ function getReadySince(prNumber, fallback) {
  *   'evicted'   - conflict or retry-cap eviction advanced the queue
  *   'released'  - non-conflict failure released the claim for a later retry
  */
-async function updateBranchAndWatch(prNumber, depth = 0) {
+async function updateBranchAndWatch(prNumber: PrNumber, depth = 0): Promise<'watching' | 'evicted' | 'released'> {
   enableAutoMerge(prNumber)
 
   const before = DRY_RUN
     ? 'dry-run-placeholder-sha'
-    : ghJson(['pr', 'view', String(prNumber), '--json', 'headRefOid']).headRefOid
+    : ghJson<{ headRefOid: string }>(['pr', 'view', String(prNumber), '--json', 'headRefOid']).headRefOid
 
   logAction(`call PUT /pulls/${prNumber}/update-branch`)
   if (DRY_RUN) {
@@ -586,7 +636,7 @@ async function updateBranchAndWatch(prNumber, depth = 0) {
     // rather than treat a not-yet-computed result as "not a conflict",
     // which would misdiagnose a real conflict that just hasn't resolved
     // yet with the misleading "not a merge conflict" retry message.
-    let mergeable = ghJson(['pr', 'view', String(prNumber), '--json', 'mergeable']).mergeable
+    let mergeable = ghJson<{ mergeable: string }>(['pr', 'view', String(prNumber), '--json', 'mergeable']).mergeable
     mergeable = await resolveMergeable(prNumber, mergeable)
     if (mergeable === 'CONFLICTING') {
       await evict(
@@ -667,7 +717,7 @@ async function updateBranchAndWatch(prNumber, depth = 0) {
   let newSha = before
   for (let attempt = 0; attempt < UPDATE_BRANCH_POLL_ATTEMPTS; attempt++) {
     await sleep(UPDATE_BRANCH_POLL_INTERVAL_MS)
-    const current = ghJson(['pr', 'view', String(prNumber), '--json', 'headRefOid']).headRefOid
+    const current = ghJson<{ headRefOid: string }>(['pr', 'view', String(prNumber), '--json', 'headRefOid']).headRefOid
     if (current !== before) {
       newSha = current
       break
@@ -705,8 +755,8 @@ async function updateBranchAndWatch(prNumber, depth = 0) {
  * Also handles: PR closed/merged while claimed, ready label removed, real
  * conflicts, and MERGE_QUEUE_SHA drift after our own update-branch.
  */
-async function maintainInFlight(prNumber, depth = 0) {
-  let snap
+async function maintainInFlight(prNumber: PrNumber, depth = 0): Promise<void> {
+  let snap: PrSnapshot
   try {
     snap = viewPr(prNumber)
   } catch (err) {
@@ -780,7 +830,7 @@ async function maintainInFlight(prNumber, depth = 0) {
   const mergeable = await resolveMergeable(prNumber, snap.mergeable)
   // Re-read mergeStateStatus after any UNKNOWN settle -- cheap and more
   // accurate if GitHub finished computing during the poll above.
-  const status = ghJson(['pr', 'view', String(prNumber), '--json', 'mergeStateStatus,headRefOid,autoMergeRequest'])
+  const status = ghJson<PrStatus>(['pr', 'view', String(prNumber), '--json', 'mergeStateStatus,headRefOid,autoMergeRequest'])
   const mergeStateStatus = status.mergeStateStatus
   const headRefOid = status.headRefOid
 
@@ -824,7 +874,7 @@ async function maintainInFlight(prNumber, depth = 0) {
 
 // ---- commands ----
 
-async function dequeue(depth = 0, excludePr = '') {
+async function dequeue(depth = 0, excludePr = ''): Promise<void> {
   if (depth > MAX_DEQUEUE_RECURSION_DEPTH) {
     log(
       `Reached the max recursion depth (${MAX_DEQUEUE_RECURSION_DEPTH}) of dequeue<->evict calls in a single run -- stopping here rather than risking a runaway loop. Whatever's left in the queue will be picked up by the next real trigger (push, label, or the watchdog).`,
@@ -851,7 +901,7 @@ async function dequeue(depth = 0, excludePr = '') {
     return
   }
 
-  const prs = ghJson([
+  const prs = ghJson<GhPrListItem[]>([
     'pr',
     'list',
     '--state',
@@ -969,7 +1019,7 @@ async function dequeue(depth = 0, excludePr = '') {
   )
 }
 
-async function checkCompletion() {
+async function checkCompletion(): Promise<void> {
   const pr = getVar('MERGE_QUEUE_PR')
   const sha = getVar('MERGE_QUEUE_SHA')
   if (!pr || !sha || sha === 'pending') {
@@ -981,7 +1031,7 @@ async function checkCompletion() {
   // and not stranded BEHIND the base (auto-merge can't finish under strict
   // required status checks). This also recovers if the PR merged/closed via
   // a path that never fired our cleanup job.
-  let snap
+  let snap: PrSnapshot
   try {
     snap = viewPr(pr)
   } catch (err) {
@@ -1048,9 +1098,9 @@ async function checkCompletion() {
     setVar('MERGE_QUEUE_SHA', snap.headRefOid)
   }
 
-  let checks
+  let checks: GhCheck[]
   try {
-    checks = ghJsonAsDefaultToken(['pr', 'checks', pr, '--required', '--json', 'name,bucket,link'])
+    checks = ghJsonAsDefaultToken<GhCheck[]>(['pr', 'checks', pr, '--required', '--json', 'name,bucket,link'])
   } catch (err) {
     // Transient API failure (or gh's "no checks reported" error, which
     // exits 1 even with --json). Keep the claim and stay green -- the next
@@ -1094,7 +1144,7 @@ async function checkCompletion() {
     // per-PR auto-merge, but cheap to guard against regardless. Re-verify
     // and retry here, on every check-completion run, rather than trusting
     // the single claim-time attempt.
-    const autoMergeState = ghJson(['pr', 'view', pr, '--json', 'autoMergeRequest']).autoMergeRequest
+    const autoMergeState = ghJson<{ autoMergeRequest: { enabledBy?: string } | null }>(['pr', 'view', pr, '--json', 'autoMergeRequest']).autoMergeRequest
     if (!autoMergeState) {
       log(`PR #${pr} has no active auto-merge request. Retrying enableAutoMerge (checks are otherwise green).`)
       enableAutoMerge(pr)
@@ -1111,7 +1161,7 @@ async function checkCompletion() {
   )
 }
 
-async function cleanup() {
+async function cleanup(): Promise<void> {
   const pr = getVar('MERGE_QUEUE_PR')
   if (!pr || pr !== EVENT_PR_NUMBER) {
     log(`PR #${EVENT_PR_NUMBER} is not the tracked in-flight PR (tracked: ${pr || 'none'}). Nothing to do.`)
@@ -1126,7 +1176,7 @@ async function cleanup() {
   if (EVENT_ACTION === 'synchronize') {
     log(`Synchronize on in-flight PR #${EVENT_PR_NUMBER}; refreshing watched SHA (keeping claim).`)
     if (DRY_RUN) return
-    const head = ghJson(['pr', 'view', EVENT_PR_NUMBER, '--json', 'headRefOid']).headRefOid
+    const head = ghJson<{ headRefOid: string }>(['pr', 'view', EVENT_PR_NUMBER, '--json', 'headRefOid']).headRefOid
     setVar('MERGE_QUEUE_SHA', head)
     enableAutoMerge(EVENT_PR_NUMBER)
     log(`Now watching PR #${EVENT_PR_NUMBER} at ${head}.`)
@@ -1144,14 +1194,14 @@ async function cleanup() {
   // The queue is idle again now, but nothing else guarantees a fresh dequeue
   // gets triggered -- an unlabeled/close on the in-flight PR isn't a push
   // or a labeled event itself. Without this, a still-ready PR elsewhere in
-  // the queue would sit stalled until some unrelated event happened to fire.
+  // the queue would sit stalled until some unrelated trigger fired.
   // Pick up the next one immediately instead (excluding the PR that just
   // closed/unlabeled -- the search index may still return it for a few
   // seconds).
   await dequeue(0, String(EVENT_PR_NUMBER))
 }
 
-async function watchdog() {
+async function watchdog(): Promise<void> {
   const pr = getVar('MERGE_QUEUE_PR')
   const claimedAt = getVar('MERGE_QUEUE_CLAIMED_AT')
   if (!pr || !claimedAt) {
@@ -1196,7 +1246,7 @@ async function watchdog() {
   //  - all green + auto-merge active → something else is blocking merge
   //    (review, conversation, deploy-lock, permissions); comment+evict so
   //    a human can look rather than blocking the rest of the queue forever
-  let snap
+  let snap: PrSnapshot
   try {
     snap = viewPr(stillPr)
   } catch (err) {
@@ -1215,7 +1265,7 @@ async function watchdog() {
   }
 
   try {
-    const checks = ghJsonAsDefaultToken(['pr', 'checks', stillPr, '--required', '--json', 'name,bucket,link'])
+    const checks = ghJsonAsDefaultToken<GhCheck[]>(['pr', 'checks', stillPr, '--required', '--json', 'name,bucket,link'])
     // 'fail' only -- cancelled gets the bounded re-run treatment below, not
     // an eviction (job timeouts report as cancelled; see check-completion).
     const failing = checks.filter((c) => c.bucket === 'fail')
@@ -1275,7 +1325,7 @@ async function watchdog() {
   )
 }
 
-const commands = { dequeue, 'check-completion': checkCompletion, cleanup, watchdog }
+const commands: Record<string, () => Promise<void>> = { dequeue, 'check-completion': checkCompletion, cleanup, watchdog }
 const run = commands[COMMAND]
 if (!run) {
   throw new Error(`Unknown command: ${COMMAND}`)
