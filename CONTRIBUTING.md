@@ -13,8 +13,6 @@ node --test priority.test.ts state.test.ts
 `npm run build` is a typecheck (`tsc --noEmit`); `npm test` runs the full
 suite with the 100% coverage gate.
 
-Project board sync tests live under `actions/project-sync/tests`.
-
 ## Releasing
 
 Tag a `v1.x` commit when the change is ready for callers. Move the floating
