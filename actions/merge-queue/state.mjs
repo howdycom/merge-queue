@@ -1,3 +1,5 @@
+import { errorText } from './errors.mjs'
+
 // Queue coordination state stored as a JSON file on a dedicated branch.
 // GITHUB_TOKEN can write repository contents (contents: write) but cannot
 // write Actions variables, which is why this replaced the vars-based store.
@@ -28,7 +30,7 @@ export function createQueueState({
       ghJson(['api', `repos/${repo}/git/ref/heads/${STATE_BRANCH}`])
       return
     } catch (err) {
-      const message = String(err.stderr || err.message || err)
+      const message = errorText(err)
       if (!/404|Not Found/.test(message)) {
         throw err
       }
@@ -36,7 +38,6 @@ export function createQueueState({
     const defaultBranch = ghJson(['api', `repos/${repo}`]).default_branch
     const sha = ghJson(['api', `repos/${repo}/git/ref/heads/${defaultBranch}`]).object.sha
     logAction(`create branch ${STATE_BRANCH}`)
-    if (dryRun) return
     ghApiJson('POST', `repos/${repo}/git/refs`, {
       ref: `refs/heads/${STATE_BRANCH}`,
       sha,
@@ -47,7 +48,7 @@ export function createQueueState({
     try {
       return ghJson(['api', `repos/${repo}/contents/${STATE_PATH}?ref=${STATE_BRANCH}`])
     } catch (err) {
-      const message = String(err.stderr || err.message || err)
+      const message = errorText(err)
       if (/404|Not Found/.test(message)) return null
       throw err
     }
@@ -74,7 +75,7 @@ export function createQueueState({
       }
     } catch (err) {
       log(
-        `Warning: could not migrate in-flight claim from ${processingLabel}: ${String(err.stderr || err.message || err).split('\n')[0]}`,
+        `Warning: could not migrate in-flight claim from ${processingLabel}: ${errorText(err).split('\n')[0]}`,
       )
       return emptyState()
     }
@@ -92,7 +93,7 @@ export function createQueueState({
         return
       }
     } catch (err) {
-      const message = String(err.stderr || err.message || err)
+      const message = errorText(err)
       if (!/404|Not Found/.test(message)) {
         log(`Warning: unexpected error reading ${STATE_PATH}: ${message.split('\n')[0]}`)
       }
@@ -103,7 +104,6 @@ export function createQueueState({
   }
 
   function flush() {
-    if (dryRun) return
     ensureBranch()
     const body = {
       message: 'merge-queue: update coordination state',
@@ -115,7 +115,7 @@ export function createQueueState({
       const result = JSON.parse(ghApiJson('PUT', `repos/${repo}/contents/${STATE_PATH}`, body))
       blobSha = result.content?.sha || blobSha
     } catch (err) {
-      const message = String(err.stderr || err.message || err)
+      const message = errorText(err)
       if (/409|sha/.test(message)) {
         const latest = readFile()
         blobSha = latest?.sha || null
@@ -152,8 +152,11 @@ export function createQueueState({
       return
     }
     logAction(`delete variable ${name}`)
+    // Dry-run must not forget the claim. queue.mjs relies on that so a
+    // chained dequeue stops instead of replaying the same decision.
+    if (dryRun) return
     delete cache[name]
-    if (!dryRun) flush()
+    flush()
   }
 
   function clearQueueState() {
