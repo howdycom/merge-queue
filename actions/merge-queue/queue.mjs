@@ -44,6 +44,8 @@
 //                                 human re-queue starts at 0; pruned on
 //                                 dequeue for PRs no longer in the ready list.
 import { execFileSync } from 'node:child_process'
+import { errorText } from './errors.mjs'
+import { paginate } from './pagination.mjs'
 import {
   classifyTier as rankPullRequest,
   compareQueueItems,
@@ -81,21 +83,21 @@ const STALE_AFTER_MINUTES = Number(process.env.MQ_STALE_AFTER_MINUTES || '90')
 const EVENT_PR_NUMBER = process.env.MQ_EVENT_PR_NUMBER || ''
 const EVENT_ACTION = process.env.MQ_EVENT_ACTION || ''
 const DRY_RUN = process.env.MQ_DRY_RUN === 'true'
-const UPDATE_BRANCH_POLL_ATTEMPTS = 12
-const UPDATE_BRANCH_POLL_INTERVAL_MS = 5000
+const UPDATE_BRANCH_POLL_ATTEMPTS = Number(process.env.MQ_UPDATE_BRANCH_POLL_ATTEMPTS || '12')
+const UPDATE_BRANCH_POLL_INTERVAL_MS = Number(process.env.MQ_UPDATE_BRANCH_POLL_INTERVAL_MS || '5000')
 // Short poll for GitHub's mergeable computation to settle out of UNKNOWN
 // after a failed update-branch call, before trusting it to decide whether
 // a failure was a real conflict. Much shorter than the SHA-settle poll
 // above -- this is normally quick, and it's already inside a failure path.
-const MERGEABLE_POLL_ATTEMPTS = 5
-const MERGEABLE_POLL_INTERVAL_MS = 3000
+const MERGEABLE_POLL_ATTEMPTS = Number(process.env.MQ_MERGEABLE_POLL_ATTEMPTS || '5')
+const MERGEABLE_POLL_INTERVAL_MS = Number(process.env.MQ_MERGEABLE_POLL_INTERVAL_MS || '3000')
 // Backstop for the dequeue<->evict recursion below. Bounded in the normal
 // case by how many PRs are actually ready (each eviction removes one from
 // candidacy), but that assumption depends on removeLabel(READY_LABEL)
 // actually succeeding -- if it silently fails for a real reason, the same
 // PR could get reselected and re-evicted in a tight loop. This is a hard
 // ceiling independent of that, not a realistic queue-depth estimate.
-const MAX_DEQUEUE_RECURSION_DEPTH = 20
+const MAX_DEQUEUE_RECURSION_DEPTH = Number(process.env.MQ_MAX_DEQUEUE_RECURSION_DEPTH || '20')
 // How many consecutive non-conflict update-branch failures the *same* PR
 // gets before it's evicted instead of released for another retry. Without
 // this, a permanent-but-not-a-conflict failure (a fork PR this token can't
@@ -205,44 +207,8 @@ function ghApiSupportsSlurp() {
   return cachedGhApiSupportsSlurp
 }
 
-function appendQueryParam(endpoint, key, value) {
-  // Drop any existing occurrence of the key so page= can be set cleanly.
-  const withoutKey = endpoint
-    .replace(new RegExp(`([?&])${key}=[^&]*&?`), '$1')
-    .replace(/[?&]$/, '')
-  const sep = withoutKey.includes('?') ? '&' : '?'
-  return `${withoutKey}${sep}${key}=${encodeURIComponent(value)}`
-}
-
-function getQueryParam(endpoint, key) {
-  const match = endpoint.match(new RegExp(`[?&]${key}=([^&]*)`))
-  return match ? decodeURIComponent(match[1]) : null
-}
-
 function ghPaginatedJson(endpoint) {
-  if (ghApiSupportsSlurp()) {
-    const pages = ghJson(['api', '--paginate', '--slurp', endpoint])
-    return Array.isArray(pages) ? pages.flat() : pages
-  }
-
-  const perPage = Number(getQueryParam(endpoint, 'per_page')) || 100
-  let base = getQueryParam(endpoint, 'per_page')
-    ? endpoint
-    : appendQueryParam(endpoint, 'per_page', String(perPage))
-  // page= is owned by the loop below
-  base = base
-    .replace(new RegExp(`([?&])page=[^&]*&?`), '$1')
-    .replace(/[?&]$/, '')
-
-  const items = []
-  const maxPages = 100
-  for (let page = 1; page <= maxPages; page += 1) {
-    const batch = ghJson(['api', appendQueryParam(base, 'page', String(page))])
-    if (!Array.isArray(batch)) return batch
-    items.push(...batch)
-    if (batch.length < perPage) break
-  }
-  return items
+  return paginate(endpoint, { ghJson, supportsSlurp: ghApiSupportsSlurp() })
 }
 
 function sleep(ms) {
@@ -326,7 +292,7 @@ function removeLabel(prNumber, label) {
     // removing READY_LABEL silently fails for a real reason, the same PR
     // could get reselected and re-evicted in a tight loop with nothing
     // bounding it otherwise.
-    const message = String(err.message || err)
+    const message = errorText(err)
     if (!/404/.test(message)) {
       log(`Warning: could not remove label "${label}" from PR #${prNumber}, treating as already absent: ${message.split('\n')[0]}`)
     }
@@ -351,7 +317,7 @@ function enableAutoMerge(prNumber) {
   } catch (err) {
     // Already enabled, or the repo/PR doesn't allow it -- log and continue;
     // check-completion/watchdog will still catch a PR that never merges.
-    log(`Warning: could not enable auto-merge on PR #${prNumber}: ${String(err.message || err).split('\n')[0]}`)
+    log(`Warning: could not enable auto-merge on PR #${prNumber}: ${errorText(err).split('\n')[0]}`)
   }
 }
 
@@ -423,7 +389,7 @@ async function softRequeueToBack(prNumber, body, depth = 0) {
     addLabel(prNumber, READY_LABEL)
   } catch (err) {
     log(
-      `Warning: could not re-add "${READY_LABEL}" to PR #${prNumber} during soft-requeue: ${String(err.message || err).split('\n')[0]}. The PR is OUT of the queue until a human re-adds the label.`,
+      `Warning: could not re-add "${READY_LABEL}" to PR #${prNumber} during soft-requeue: ${errorText(err).split('\n')[0]}. The PR is OUT of the queue until a human re-adds the label.`,
     )
   }
   bumpYieldCount(prNumber)
@@ -486,7 +452,7 @@ async function rerunCancelledChecks(prNumber, cancelled) {
         log(`Run ${runId} is ${status} -- a re-run is already underway. Not counting an attempt; waiting for it to finish.`)
       }
     } catch (err) {
-      log(`Warning: could not read status of run ${runId}: ${String(err.stderr || err.message || err).split('\n')[0]}. Skipping it this pass.`)
+      log(`Warning: could not read status of run ${runId}: ${errorText(err).split('\n')[0]}. Skipping it this pass.`)
     }
   }
   if (completedRunIds.length === 0) return
@@ -524,7 +490,7 @@ async function rerunCancelledChecks(prNumber, cancelled) {
       started++
     } catch (err) {
       log(
-        `Warning: could not re-run workflow run ${runId}: ${String(err.stderr || err.message || err).split('\n')[0]}. If this is "Resource not accessible", the calling job needs \`actions: write\` for its default GITHUB_TOKEN (see the README). The attempt still counts toward the cap, so this cannot loop forever.`,
+        `Warning: could not re-run workflow run ${runId}: ${errorText(err).split('\n')[0]}. If this is "Resource not accessible", the calling job needs \`actions: write\` for its default GITHUB_TOKEN (see the README). The attempt still counts toward the cap, so this cannot loop forever.`,
       )
     }
   }
@@ -591,7 +557,7 @@ async function updateBranchAndWatch(prNumber, depth = 0) {
   try {
     gh(['api', '-X', 'PUT', `repos/${REPO}/pulls/${prNumber}/update-branch`])
   } catch (err) {
-    const message = String(err.stderr || err.message || err)
+    const message = errorText(err)
     log(`update-branch failed for PR #${prNumber}: ${message}`)
     if (ALREADY_UP_TO_DATE_RE.test(message)) {
       // Already current with the target branch -- not a failure, proceed
@@ -745,7 +711,7 @@ async function maintainInFlight(prNumber, depth = 0) {
     snap = viewPr(prNumber)
   } catch (err) {
     log(
-      `Could not load in-flight PR #${prNumber} (${String(err.message || err).split('\n')[0]}). Clearing claim so the queue can advance.`,
+      `Could not load in-flight PR #${prNumber} (${errorText(err).split('\n')[0]}). Clearing claim so the queue can advance.`,
     )
     clearQueueState()
     await dequeue(depth + 1, String(prNumber))
@@ -1019,7 +985,7 @@ async function checkCompletion() {
   try {
     snap = viewPr(pr)
   } catch (err) {
-    log(`Could not load PR #${pr} for check-completion: ${String(err.message || err).split('\n')[0]}`)
+    log(`Could not load PR #${pr} for check-completion: ${errorText(err).split('\n')[0]}`)
     return
   }
 
@@ -1092,7 +1058,7 @@ async function checkCompletion() {
     // drowns out real failures in the Actions tab (same rationale as the
     // watchdog's identical guard).
     log(
-      `Could not read required checks for PR #${pr}: ${String(err.stderr || err.message || err).split('\n')[0]}. Leaving the claim for a later pass.`,
+      `Could not read required checks for PR #${pr}: ${errorText(err).split('\n')[0]}. Leaving the claim for a later pass.`,
     )
     return
   }
@@ -1234,7 +1200,7 @@ async function watchdog() {
   try {
     snap = viewPr(stillPr)
   } catch (err) {
-    log(`Could not load stale PR #${stillPr}: ${String(err.message || err).split('\n')[0]}. Evicting claim.`)
+    log(`Could not load stale PR #${stillPr}: ${errorText(err).split('\n')[0]}. Evicting claim.`)
     clearQueueState()
     await dequeue(0, String(stillPr))
     return
@@ -1300,7 +1266,7 @@ async function watchdog() {
       return
     }
   } catch (err) {
-    log(`Could not read required checks for stale PR #${stillPr}: ${String(err.message || err).split('\n')[0]}`)
+    log(`Could not read required checks for stale PR #${stillPr}: ${errorText(err).split('\n')[0]}`)
   }
 
   await evict(

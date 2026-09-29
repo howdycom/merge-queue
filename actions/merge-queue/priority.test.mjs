@@ -341,4 +341,59 @@ describe('yield count persistence encoding', () => {
     assert.equal(pruneYieldCounts('100:1,200:3,300:1', [200, '300']), '200:3,300:1')
     assert.equal(pruneYieldCounts('100:1', []), '')
   })
+
+  it('orders yield keys that share a number by their text', () => {
+    assert.equal(serializeYieldCounts({ 10: 1, '02': 1, 2: 1 }), '02:1,2:1,10:1')
+  })
+})
+
+describe('remaining classifier branches', () => {
+  it('treats a null fallback and a null author list as empty', () => {
+    assert.deepEqual(parseLabelList(null, null), [])
+    assert.deepEqual(parseLabelList('   ', null), [])
+    assert.equal(
+      classifyTier(
+        { title: 'plain', author: { login: 'dependabot' } },
+        {
+          labels: ['bug'],
+          tier1TitleRegex: HOTFIX,
+          tier2TitleRegex: HCP,
+          deprioritizedTitleRegex: TECH,
+          deprioritizedAuthors: null,
+        },
+      ),
+      3,
+    )
+  })
+
+  it('ignores blank deprioritized author tokens and still matches the rest', () => {
+    assert.equal(
+      classifyTier(
+        { title: 'plain', author: 'dependabot', labels: [] },
+        {
+          labels: ['bug'],
+          tier1TitleRegex: HOTFIX,
+          tier2TitleRegex: HCP,
+          deprioritizedTitleRegex: null,
+          deprioritizedAuthors: ['', 'dependabot'],
+        },
+      ),
+      5,
+    )
+  })
+
+  it('treats a missing PR number as zero from either side', () => {
+    const numbered = { tier: 1, createdAt: 'not-a-date', number: 4 }
+    const blank = { tier: 1, createdAt: 'not-a-date' }
+    assert.equal(compareQueueItems(numbered, blank), 4)
+    assert.equal(compareQueueItems(blank, numbered), -4)
+    assert.equal(compareQueueItems({ tier: 1, createdAt: 'not-a-date', number: 0 }, blank), 0)
+  })
+
+  it('sorts a missing timestamp behind a real one from either side', () => {
+    const valid = { tier: 1, createdAt: '2026-01-01T00:00:00Z', number: 1 }
+    const missing = { tier: 1, createdAt: 'not-a-date', number: 2 }
+    assert.equal(compareQueueItems(valid, missing), -1)
+    assert.equal(compareQueueItems(missing, valid), 1)
+  })
 })

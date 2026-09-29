@@ -176,7 +176,7 @@ export function parseYieldCounts(raw) {
 export function serializeYieldCounts(counts) {
   return Object.entries(counts)
     .filter(([, n]) => Number.isFinite(n) && n > 0)
-    .sort(([a], [b]) => Number(a) - Number(b) || (a < b ? -1 : a > b ? 1 : 0))
+    .sort(([a], [b]) => Number(a) - Number(b) || a.localeCompare(b))
     .map(([pr, n]) => `${pr}:${n}`)
     .join(',')
 }
