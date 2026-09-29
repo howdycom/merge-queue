@@ -97,7 +97,7 @@ runs:
         node-version: '22'
 
     # Self-hosted light runners may ship a years-old `gh` that lacks fields
-    # queue.mjs depends on (e.g. headRefOid, added in gh 2.18; --slurp ~2.48).
+    # queue.ts depends on (e.g. headRefOid, added in gh 2.18; --slurp ~2.48).
     # Prefer the latest GitHub CLI release, but a brand-new cli/cli tag (or a
     # transient GitHub Releases 503) must not fail the queue — retry, then
     # walk back through recent stables and install the first tarball that
@@ -124,7 +124,7 @@ runs:
           printf '%s\n%s\n' "$1" "$2" | sort -V | head -1 | grep -qx "$2"
         }
 
-        # Floor for fields queue.mjs uses today (headRefOid, autoMergeRequest, etc.).
+        # Floor for fields queue.ts uses today (headRefOid, autoMergeRequest, etc.).
         # We still prefer latest; this is the "already good enough" bar when the
         # GitHub Releases CDN will not serve a newer tarball.
         MIN_GH_VERSION='2.48.0'
@@ -264,4 +264,4 @@ runs:
         MQ_EVENT_PR_NUMBER: ${{ inputs.event_pr_number }}
         MQ_EVENT_ACTION: ${{ inputs.event_action }}
         MQ_DRY_RUN: ${{ inputs.dry_run }}
-      run: node "${{ github.action_path }}/queue.mjs"
+      run: node "${{ github.action_path }}/queue.ts"

@@ -79,4 +79,4 @@ runs:
         CLAUDE_REMEDIATION_PROTECTED_BRANCHES: ${{ inputs.protected_branches }}
         CLAUDE_REMEDIATION_SENSITIVE_PATH_PREFIXES: ${{ inputs.sensitive_path_prefixes }}
         CLAUDE_REMEDIATION_SENSITIVE_FILE_NAMES: ${{ inputs.sensitive_file_names }}
-      run: node "${{ github.action_path }}/prepare.mjs"
+      run: node "${{ github.action_path }}/prepare.ts"

@@ -1,15 +1,21 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { createQueueState, STATE_BRANCH, STATE_PATH } from './state.mjs'
+import { createQueueState, STATE_BRANCH, STATE_PATH, type QueueStateDeps } from './state.ts'
 
-function b64(obj) {
+function b64(obj: unknown): string {
   return Buffer.from(`${JSON.stringify(obj, null, 2)}\n`).toString('base64')
 }
 
-function makeStore(overrides = {}) {
-  const logs = []
-  const puts = []
-  const refs = { [STATE_BRANCH]: Boolean(overrides.file) }
+interface StoreOverrides {
+  file?: { sha: string; content: string } | null
+  issues?: unknown
+  deps?: Partial<QueueStateDeps>
+}
+
+function makeStore(overrides: StoreOverrides = {}) {
+  const logs: string[] = []
+  const puts: Array<{ ref: string; content: string }> = []
+  const refs: Record<string, boolean> = { [STATE_BRANCH]: Boolean(overrides.file) }
   let file = overrides.file ?? null
   const store = createQueueState({
     repo: 'howdycom/astro-market',
@@ -25,7 +31,7 @@ function makeStore(overrides = {}) {
       }
       if (path === `repos/howdycom/astro-market/git/ref/heads/${STATE_BRANCH}`) {
         if (!refs[STATE_BRANCH]) {
-          const err = new Error('Not Found')
+          const err = new Error('Not Found') as Error & { stderr: string }
           err.stderr = 'HTTP 404: Not Found'
           throw err
         }
@@ -33,7 +39,7 @@ function makeStore(overrides = {}) {
       }
       if (String(path).startsWith(`repos/howdycom/astro-market/contents/${STATE_PATH}`)) {
         if (!file) {
-          const err = new Error('Not Found')
+          const err = new Error('Not Found') as Error & { stderr: string }
           err.stderr = 'HTTP 404: Not Found'
           throw err
         }
@@ -48,15 +54,16 @@ function makeStore(overrides = {}) {
       throw new Error(`unexpected ghJson ${args.join(' ')}`)
     },
     ghApiJson: (method, endpoint, body) => {
+      const payload = body as { ref: string; content: string }
       if (method === 'POST' && endpoint.endsWith('/git/refs')) {
         refs[STATE_BRANCH] = true
-        return JSON.stringify({ ref: body.ref })
+        return JSON.stringify({ ref: payload.ref })
       }
       if (method === 'PUT' && endpoint.endsWith(STATE_PATH)) {
-        puts.push(body)
+        puts.push(payload)
         file = {
           sha: `blob-${puts.length}`,
-          content: body.content,
+          content: payload.content,
         }
         refs[STATE_BRANCH] = true
         return JSON.stringify({ content: { sha: file.sha } })
@@ -90,7 +97,7 @@ test('setVar writes JSON on the state branch', () => {
   store.setVar('MERGE_QUEUE_SHA', 'def')
   assert.equal(store.getVar('MERGE_QUEUE_PR'), '99')
   assert.ok(puts.length >= 2)
-  const written = JSON.parse(Buffer.from(puts.at(-1).content, 'base64').toString('utf8'))
+  const written = JSON.parse(Buffer.from(puts.at(-1)?.content ?? '', 'base64').toString('utf8'))
   assert.equal(written.MERGE_QUEUE_PR, '99')
   assert.equal(written.MERGE_QUEUE_SHA, 'def')
 })
@@ -125,7 +132,7 @@ test('ensureBranch rethrows a non-404 ref error', () => {
   const broken = makeStore({
     deps: {
       ghJson: () => {
-        const err = new Error('denied')
+        const err = new Error('denied') as Error & { stderr: string }
         err.stderr = 'HTTP 500'
         throw err
       },
@@ -158,7 +165,7 @@ test('migration covers an empty label, several processing PRs, a missing sha, an
         if (path.includes('/issues?')) return [{ number: 5, pull_request: {} }]
         if (path === 'repos/howdycom/astro-market') return { default_branch: 'main' }
         if (path.endsWith('/git/ref/heads/main')) return { object: { sha: 'default-sha' } }
-        const err = new Error('Not Found')
+        const err = new Error('Not Found') as Error & { stderr: string }
         err.stderr = 'HTTP 404: Not Found'
         throw err
       },
@@ -212,7 +219,7 @@ test('flush retries a 409, keeps a missing content sha, and rethrows other write
       ghApiJson: (method, endpoint, body) => {
         if (method === 'PUT' && !conflicted) {
           conflicted = true
-          const err = new Error('409 sha')
+          const err = new Error('409 sha') as Error & { stderr: string }
           err.stderr = '409 sha mismatch'
           throw err
         }
@@ -241,7 +248,7 @@ test('flush retries a 409, keeps a missing content sha, and rethrows other write
     deps: {
       ghApiJson: (method) => {
         if (method === 'POST') return JSON.stringify({ ref: 'ok' })
-        const err = new Error('nope')
+        const err = new Error('nope') as Error & { stderr: string }
         err.stderr = 'HTTP 500'
         throw err
       },
@@ -274,7 +281,7 @@ test('missing files are recognized from message text and from a thrown string', 
       ghApiJson: (method) => {
         if (method === 'POST') return JSON.stringify({ ref: 'ok' })
         if (method === 'PUT') {
-          const err = new Error('conflict')
+          const err = new Error('conflict') as Error & { stderr: string }
           err.stderr = 'sha mismatch'
           throw err
         }
@@ -303,7 +310,7 @@ test('a 409 retry with no latest file omits the blob sha', () => {
       ghJson: (args) => {
         const path = String(args.at(-1))
         if (path.includes('/contents/')) {
-          const err = new Error('Not Found')
+          const err = new Error('Not Found') as Error & { stderr: string }
           err.stderr = 'HTTP 404: Not Found'
           throw err
         }
@@ -318,7 +325,8 @@ test('a 409 retry with no latest file omits the blob sha', () => {
           err.message = '409 sha'
           throw err
         }
-        assert.equal(body.sha, undefined)
+        const payload = body as { sha?: string }
+        assert.equal(payload.sha, undefined)
         return JSON.stringify({})
       },
     },

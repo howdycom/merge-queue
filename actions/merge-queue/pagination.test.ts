@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { appendQueryParam, getQueryParam, paginate } from './pagination.mjs'
+import { appendQueryParam, getQueryParam, paginate } from './pagination.ts'
 
 test('appendQueryParam replaces an existing key and preserves the rest', () => {
   assert.equal(appendQueryParam('repos/o/r/issues?per_page=100&page=2', 'page', '3'), 'repos/o/r/issues?per_page=100&page=3')
@@ -11,7 +11,7 @@ test('appendQueryParam replaces an existing key and preserves the rest', () => {
 })
 
 test('paginate walks pages when slurp is unavailable and stops on a short page', () => {
-  const seen = []
+  const seen: string[] = []
   const items = paginate('repos/o/r/timeline', {
     supportsSlurp: false,
     ghJson: (args) => {
@@ -19,13 +19,13 @@ test('paginate walks pages when slurp is unavailable and stops on a short page',
       const page = new URL(`https://example/${args[1]}`).searchParams.get('page')
       return page === '1' ? Array.from({ length: 100 }, (_, index) => index) : [{ last: true }]
     },
-  })
+  }) as unknown[]
   assert.equal(items.length, 101)
   assert.equal(seen[0], 'repos/o/r/timeline?per_page=100&page=1')
 })
 
 test('paginate keeps an endpoint that already declares per_page', () => {
-  const seen = []
+  const seen: string[] = []
   const items = paginate('repos/o/r/timeline?per_page=2&page=8', {
     supportsSlurp: false,
     ghJson: (args) => {
@@ -69,7 +69,7 @@ test('paginate exhausts the page cap when every page is full', () => {
       pages += 1
       return ['x']
     },
-  })
+  }) as unknown[]
   assert.equal(pages, 100)
   assert.equal(items.length, 100)
 })

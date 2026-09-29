@@ -5,10 +5,11 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import type { FakePr, FakeScenario } from './fake-gh.ts'
 
 const root = dirname(fileURLToPath(import.meta.url))
 
-function pr(number, overrides = {}) {
+function pr(number: number, overrides: Partial<FakePr> = {}): FakePr {
   return {
     number,
     title: `PR ${number}`,
@@ -38,7 +39,7 @@ function pr(number, overrides = {}) {
   }
 }
 
-function run(command, scenario, env = {}) {
+function run(command: string, scenario: FakeScenario, env: Record<string, string | null | undefined> = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'mq-'))
   const scenarioPath = join(dir, 'scenario.json')
   const logPath = join(dir, 'calls.json')
@@ -47,10 +48,10 @@ function run(command, scenario, env = {}) {
   writeFileSync(logPath, '[]')
   writeFileSync(
     ghPath,
-    `#!/bin/sh\nexec ${process.execPath} ${JSON.stringify(join(root, 'fake-gh.mjs'))} "$@"\n`,
+    `#!/bin/sh\nexec ${process.execPath} ${JSON.stringify(join(root, 'fake-gh.ts'))} "$@"\n`,
   )
   chmodSync(ghPath, 0o755)
-  const childEnv = {
+  const childEnv: Record<string, string | undefined> = {
     ...process.env,
     PATH: `${dir}:/usr/bin:/bin`,
     GITHUB_REPOSITORY: 'howdycom/example',
@@ -64,12 +65,12 @@ function run(command, scenario, env = {}) {
     MQ_MERGEABLE_POLL_INTERVAL_MS: '0',
     GH_SCENARIO: scenarioPath,
     GH_CALL_LOG: logPath,
-    ...env,
   }
-  for (const [key, value] of Object.entries(childEnv)) {
+  for (const [key, value] of Object.entries(env)) {
     if (value == null) delete childEnv[key]
+    else childEnv[key] = value
   }
-  const result = spawnSync(process.execPath, [join(root, 'queue.mjs')], {
+  const result = spawnSync(process.execPath, [join(root, 'queue.ts')], {
     encoding: 'utf8',
     env: childEnv,
   })
@@ -81,11 +82,13 @@ function run(command, scenario, env = {}) {
   }
 }
 
-function world(prs, extra = {}) {
+type RunResult = ReturnType<typeof run>
+
+function world(prs: FakePr[], extra: Partial<FakeScenario> = {}): FakeScenario {
   return { prs, ready: prs.map((item) => item.number), slurp: true, ...extra }
 }
 
-function claimed(number, json = {}) {
+function claimed(number: number, json: Record<string, string> = {}): FakeScenario {
   return {
     stateBranch: true,
     stateFile: {
@@ -100,7 +103,7 @@ function claimed(number, json = {}) {
   }
 }
 
-function check(result, snippet) {
+function check(result: RunResult, snippet?: RegExp): void {
   assert.equal(
     result.status,
     0,
@@ -864,5 +867,4 @@ test('timeline with no ready label falls back to createdAt', () => {
     /ready since 2026-01-07/,
   )
 })
-
 
