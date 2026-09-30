@@ -9,17 +9,15 @@ all action inputs as untrusted and keep the runtime dependency-free.
 
 ## Project overview
 
-Public composite GitHub Actions. Consumers pin releases (`@v1` or a tag), so
-every change here is a public API change — see Releasing in `CONTRIBUTING.md`.
+Public composite GitHub Action (plus a reusable workflow) for a single-flight
+merge queue. Consumers pin releases (`@v1` or a tag), so every change here is
+a public API change — see Releasing in `CONTRIBUTING.md`.
 
-| Action                      | Language                 | Purpose                                                              |
-| --------------------------- | ------------------------ | -------------------------------------------------------------------- |
-| `actions/merge-queue/`      | TypeScript (zero-dep)    | Merge-queue state machine (`queue.ts` + `state/priority/pagination/errors.ts`) |
-| `actions/project-sync/`     | Python                   | Project board sync (`project_sync.py`)                               |
-| `actions/slack-notification/` | Composite              | Slack notifications                                                  |
-| `actions/free-disk-space/`  | Composite                | Disk cleanup                                                         |
-| `actions/claude-remediation-prepare/` | TypeScript (zero-dep) | Slash-command trigger validation + PR context gathering (`prepare.ts`) |
-| `actions/open-remediation-pr/` | Composite              | Nested remediation PR mechanics                                      |
+`actions/merge-queue/` is the only action left: a zero-dependency TypeScript
+state machine (`queue.ts` + `state/priority/pagination/errors.ts`).
+Former companion actions (free-disk-space, slack-notification,
+claude-remediation-prepare, open-remediation-pr, project-sync) each live in
+their own `howdycom/<name>` repository now — this repo holds no copy of them.
 
 TypeScript here runs **directly on Node via type stripping** — there is no
 build step and no emitted output. `npm run build` is a typecheck
@@ -28,12 +26,11 @@ TypeScript below).
 
 ## Environment & runtime
 
-- **Node:** 22 (CI and both composite actions pin `node-version: 22`).
+- **Node:** 22 (CI and the composite action pin `node-version: 22`).
 - **Package manager:** npm (`package-lock.json`). Never edit the lockfile by
   hand; change dependencies with `npm install`.
-- **Python:** 3.12 for `actions/project-sync` (see its test workflow).
 - **Never install a new dependency without asking the user first.** The
-  TypeScript actions are deliberately zero-dependency so they run on a bare
+  TypeScript action is deliberately zero-dependency so it runs on a bare
   runner; `node_modules` is dev tooling only (lint, typecheck, coverage).
 
 ## Key commands
@@ -48,12 +45,6 @@ npm test                                      # node --test with the 100% c8 gat
 # Scoped runs while iterating
 node --test actions/merge-queue/priority.test.ts actions/merge-queue/state.test.ts
 npx eslint --fix actions/merge-queue/queue.ts  # one file you changed
-
-# Project board sync (Python, 100% coverage enforced)
-cd actions/project-sync
-python3 -m pip install pytest coverage
-coverage run --source=project_sync -m pytest tests -q
-coverage report -m --fail-under=100
 ```
 
 ## Validation loop
@@ -89,7 +80,6 @@ task complete until verified with:
 
 These are priorities, not optional polish. Run them after the work is in
 place, fix any failures, and rerun the failing command until it passes.
-For `actions/project-sync` changes, run its pytest + coverage pair instead.
 
 ## Coverage standard
 
@@ -99,8 +89,7 @@ functions, and lines. `npm test` enforces this via `c8 --100` — **a bare
 always `npm test`, never the scoped runner alone.
 
 Do not lower coverage thresholds to make a run pass. If coverage drops, add
-or update tests until the suite is back to 100% across the board. The Python
-action has the same bar via `coverage report --fail-under=100`.
+or update tests until the suite is back to 100% across the board.
 
 ## Testing philosophy
 

@@ -17,5 +17,5 @@
     "forceConsistentCasingInFileNames": true,
     "types": ["node"]
   },
-  "include": ["actions/merge-queue/**/*.ts", "actions/claude-remediation-prepare/**/*.ts"]
+  "include": ["actions/merge-queue/**/*.ts"]
 }
