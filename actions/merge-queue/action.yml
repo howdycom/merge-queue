@@ -39,6 +39,14 @@ inputs:
     description: 'System-owned label applied on eviction.'
     required: false
     default: 'requires action'
+  block_labels:
+    description: >
+      Comma- or newline-separated labels that keep a PR out of the queue
+      even when it has the ready label (case-insensitive). The queue skips
+      such a PR, releases its claim if it is in flight, and disables its
+      auto-merge. Removing the label makes the PR eligible again.
+    required: false
+    default: 'dont merge,do not merge'
   tier1_labels:
     description: >
       Ordered comma- or newline-separated labels that focus dequeue priority.
@@ -255,6 +263,7 @@ runs:
         MQ_READY_LABEL: ${{ inputs.ready_label }}
         MQ_PROCESSING_LABEL: ${{ inputs.processing_label }}
         MQ_REQUIRES_ACTION_LABEL: ${{ inputs.requires_action_label }}
+        MQ_BLOCK_LABELS: ${{ inputs.block_labels }}
         MQ_TIER1_LABELS: ${{ inputs.tier1_labels }}
         MQ_TIER1_TITLE_REGEX: ${{ inputs.tier1_title_regex }}
         MQ_TIER2_TITLE_REGEX: ${{ inputs.tier2_title_regex }}

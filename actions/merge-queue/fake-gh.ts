@@ -250,7 +250,7 @@ if (args[0] === 'pr' && args[1] === 'comment') ok('')
 if (args[0] === 'pr' && args[1] === 'merge') {
   if (scenario.mergeError) fail(scenario.mergeError)
   const item = pr(args[2])
-  item.autoMergeRequest = { enabledBy: 'queue' }
+  item.autoMergeRequest = args.includes('--disable-auto') ? null : { enabledBy: 'queue' }
   ok('')
 }
 

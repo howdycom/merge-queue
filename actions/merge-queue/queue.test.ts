@@ -868,3 +868,65 @@ test('timeline with no ready label falls back to createdAt', () => {
   )
 })
 
+
+const BLOCKED = [{ name: 'ready to merge' }, { name: 'dont merge' }]
+
+test('dequeue skips a block-labeled PR, disables its auto-merge, and claims the next', () => {
+  const result = run('dequeue', world([
+    pr(1, { labels: BLOCKED, createdAt: '2026-01-01T00:00:00Z' }),
+    pr(2, { autoMergeRequest: null }),
+  ]))
+  check(result, /Skipping PR #1 "PR 1": labeled `dont merge`/)
+  assert.equal(result.scenario.prs[0].autoMergeRequest, null)
+  assert.equal(result.scenario.stateFile.json.MERGE_QUEUE_PR, '2')
+})
+
+test('dequeue leaves auto-merge alone on a block-labeled PR that has none', () => {
+  const result = run('dequeue', world([pr(1, { labels: BLOCKED, autoMergeRequest: null })]))
+  check(result, /labeled `dont merge`/)
+  assert.doesNotMatch(result.stdout, /disable auto-merge/)
+})
+
+test('block_labels input replaces the default list', () => {
+  const result = run('dequeue', world([pr(1, { labels: BLOCKED })]), { MQ_BLOCK_LABELS: 'hold' })
+  check(result)
+  assert.equal(result.scenario.stateFile.json.MERGE_QUEUE_PR, '1')
+})
+
+test('in-flight PR that gains a block label is released with auto-merge disabled', () => {
+  const result = run('dequeue', {
+    ...world([pr(7, { labels: [...BLOCKED, { name: 'merge-queue: processing' }] })]),
+    ...claimed(7),
+  })
+  check(result, /In-flight PR #7 is labeled `dont merge`/)
+  assert.equal(result.scenario.prs[0].autoMergeRequest, null)
+  assert.equal(result.scenario.stateFile.json.MERGE_QUEUE_PR, undefined)
+  assert.deepEqual(result.scenario.prs[0].labels, BLOCKED)
+})
+
+test('check-completion releases a block-labeled in-flight PR', () => {
+  const result = run('check-completion', {
+    ...world([pr(7, { labels: BLOCKED })]),
+    ...claimed(7),
+  })
+  check(result, /In-flight PR #7 is labeled `dont merge`/)
+  assert.equal(result.scenario.prs[0].autoMergeRequest, null)
+  assert.equal(result.scenario.stateFile.json.MERGE_QUEUE_PR, undefined)
+})
+
+test('a failed auto-merge disable is logged and the queue stays green', () => {
+  check(
+    run('dequeue', {
+      ...world([pr(7, { labels: BLOCKED })]),
+      ...claimed(7),
+      mergeError: 'gh exploded',
+    }),
+    /Warning: could not disable auto-merge on PR #7: gh exploded/,
+  )
+})
+
+test('dry-run only logs the auto-merge disable', () => {
+  const result = run('dequeue', world([pr(1, { labels: BLOCKED })]), { MQ_DRY_RUN: 'true' })
+  check(result, /\[dry-run\] would disable auto-merge on PR #1/)
+  assert.equal(result.scenario.prs[0].autoMergeRequest.enabledBy, 'queue')
+})

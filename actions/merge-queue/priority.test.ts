@@ -4,6 +4,7 @@ import {
   classifyTier,
   compareQueueItems,
   dropYieldCount,
+  findBlockLabel,
   incrementYieldCount,
   normalizeAuthor,
   parseLabelList,
@@ -51,6 +52,21 @@ function fullRank(item: TieredPr, labels: string[] = ONBOARDING_LABELS): number 
     deprioritizedAuthors: BOTS,
   })
 }
+
+describe('findBlockLabel', () => {
+  const BLOCK = parseLabelList('dont merge, do not merge')
+
+  it('returns the first block label a PR carries, ignoring case', () => {
+    assert.equal(findBlockLabel([{ name: 'ready to merge' }, { name: 'Dont Merge' }], BLOCK), 'Dont Merge')
+    assert.equal(findBlockLabel(['do not merge'], BLOCK), 'do not merge')
+  })
+
+  it('returns undefined without a block label, labels, or a configured list', () => {
+    assert.equal(findBlockLabel([{ name: 'ready to merge' }, {}], BLOCK), undefined)
+    assert.equal(findBlockLabel(undefined, BLOCK), undefined)
+    assert.equal(findBlockLabel(['dont merge'], []), undefined)
+  })
+})
 
 describe('parseLabelList', () => {
   it('splits a comma-separated list and trims tokens', () => {
