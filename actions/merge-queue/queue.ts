@@ -50,6 +50,7 @@ import {
   classifyTier as rankPullRequest,
   compareQueueItems,
   dropYieldCount,
+  findBlockLabel,
   incrementYieldCount,
   parseLabelList,
   parseYieldCounts,
@@ -76,6 +77,7 @@ interface GhPrListItem {
   isDraft: boolean
   reviewDecision?: string
   author: { login: string }
+  autoMergeRequest?: { enabledBy?: string } | null
 }
 
 interface PrSnapshot {
@@ -119,6 +121,11 @@ const REQUIRES_ACTION_LABEL = process.env.MQ_REQUIRES_ACTION_LABEL || 'requires 
 // is the generic `bug` label; product-specific names (workspace, etc.)
 // belong in the calling repo, not here.
 const TIER1_LABELS = parseLabelList(process.env.MQ_TIER1_LABELS, 'bug')
+// A PR carrying one of these never merges through the queue, whatever its
+// other labels say. Before this, `ready to merge` was the only label the
+// queue read, so a `dont merge` hold was a note for humans that the queue
+// merged straight past overnight.
+const BLOCK_LABELS = parseLabelList(process.env.MQ_BLOCK_LABELS, 'dont merge,do not merge')
 const TIER1_TITLE_REGEX = new RegExp(process.env.MQ_TIER1_TITLE_REGEX || '^\\[HOTFIX\\]', 'i')
 const TIER2_TITLE_REGEX = new RegExp(process.env.MQ_TIER2_TITLE_REGEX || '^\\[HCP-', 'i')
 const DEPRIORITIZED_TITLE_REGEX = new RegExp(
@@ -369,6 +376,36 @@ function enableAutoMerge(prNumber: PrNumber): void {
     // check-completion/watchdog will still catch a PR that never merges.
     log(`Warning: could not enable auto-merge on PR #${prNumber}: ${errorText(err).split('\n')[0]}`)
   }
+}
+
+function disableAutoMerge(prNumber: PrNumber): void {
+  logAction(`disable auto-merge on PR #${prNumber}`)
+  if (DRY_RUN) return
+  try {
+    gh(['pr', 'merge', String(prNumber), '--disable-auto'])
+  } catch (err) {
+    // Transient gh failure: stay green. The PR is no longer claimed, and the
+    // next dequeue pass that sees the block label retries this.
+    log(`Warning: could not disable auto-merge on PR #${prNumber}: ${errorText(err).split('\n')[0]}`)
+  }
+}
+
+// Release an in-flight claim on a PR that gained a block label. Keeps
+// READY_LABEL: like draft, a block label is a deliberate, reversible hold,
+// so removing it puts the PR straight back in line. Auto-merge has to go:
+// the queue armed it at claim time, and GitHub would otherwise merge the
+// PR the moment its checks pass, block label or not.
+async function releaseBlocked(prNumber: PrNumber, blockLabel: string, depth = 0): Promise<void> {
+  log(`In-flight PR #${prNumber} is labeled \`${blockLabel}\`. Releasing the claim and advancing the queue.`)
+  disableAutoMerge(prNumber)
+  removeLabel(prNumber, PROCESSING_LABEL)
+  clearYieldCount(prNumber)
+  clearQueueState()
+  comment(
+    prNumber,
+    `Paused by the merge queue: this PR is labeled \`${blockLabel}\`, so auto-merge was disabled. It keeps \`${READY_LABEL}\` and becomes eligible again once \`${blockLabel}\` is removed.`,
+  )
+  await dequeue(depth + 1, String(prNumber))
 }
 
 function viewPr(prNumber: PrNumber): PrSnapshot {
@@ -787,6 +824,12 @@ async function maintainInFlight(prNumber: PrNumber, depth = 0): Promise<void> {
     return
   }
 
+  const inFlightBlockLabel = findBlockLabel(snap.labels, BLOCK_LABELS)
+  if (inFlightBlockLabel) {
+    await releaseBlocked(prNumber, inFlightBlockLabel, depth)
+    return
+  }
+
   // Draft guard, same reasoning as the review-state guard below: dequeue
   // filters drafts at claim time, but an author can convert the in-flight
   // PR to draft afterwards, and native auto-merge can never complete a
@@ -916,7 +959,7 @@ async function dequeue(depth = 0, excludePr = ''): Promise<void> {
     '--limit',
     '100',
     '--json',
-    'number,title,labels,createdAt,isDraft,reviewDecision,author',
+    'number,title,labels,createdAt,isDraft,reviewDecision,author,autoMergeRequest',
   ])
   // excludePr is the PR a caller just evicted, requeued, or watched close.
   // `gh pr list` reads GitHub's search index, which lags label/state
@@ -967,6 +1010,16 @@ async function dequeue(depth = 0, excludePr = ''): Promise<void> {
   // dequeue claimed #3614 -- ready-labeled but CHANGES_REQUESTED since
   // 07-14 -- and the queue merged nothing for the next several hours.
   for (const next of withMeta) {
+    const blockLabel = findBlockLabel(next.labels, BLOCK_LABELS)
+    if (blockLabel) {
+      log(
+        `Skipping PR #${next.number} "${next.title}": labeled \`${blockLabel}\`. It stays queued and becomes eligible once that label is removed.`,
+      )
+      // Auto-merge may still be armed from an earlier claim or by hand, and
+      // GitHub honors it whether or not the queue claims the PR.
+      if (next.autoMergeRequest) disableAutoMerge(next.number)
+      continue
+    }
     if (next.isDraft) {
       log(
         `Skipping PR #${next.number} "${next.title}": still a draft. It stays queued and becomes eligible when marked ready for review.`,
@@ -1044,6 +1097,14 @@ async function checkCompletion(): Promise<void> {
     removeLabel(pr, PROCESSING_LABEL)
     clearQueueState()
     await dequeue(0, String(pr))
+    return
+  }
+
+  // Same block-label guard as maintainInFlight. check-completion is the
+  // last pass before native auto-merge fires on green checks.
+  const blockLabel = findBlockLabel(snap.labels, BLOCK_LABELS)
+  if (blockLabel) {
+    await releaseBlocked(pr, blockLabel)
     return
   }
 

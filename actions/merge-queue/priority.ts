@@ -37,6 +37,24 @@ export function parseLabelList(raw: string | undefined | null, fallback: string 
 }
 
 /**
+ * First configured block label the PR carries, or undefined.
+ * Case-insensitive, like GitHub's own label names: `Dont Merge` and
+ * `dont merge` cannot coexist on one repo, and a caller typing either
+ * spelling in `block_labels` means the same label.
+ */
+export function findBlockLabel(
+  labels: Array<string | { name?: string }> | undefined,
+  blockLabels: string[],
+): string | undefined {
+  const blocked = new Set(blockLabels.map((name) => name.toLowerCase()))
+  for (const entry of labels || []) {
+    const name = typeof entry === 'string' ? entry : entry.name || ''
+    if (blocked.has(name.toLowerCase())) return name
+  }
+  return undefined
+}
+
+/**
  * Canonical author login for deprioritization matching.
  * `app/dependabot`, `dependabot[bot]`, and `Dependabot` all become `dependabot`.
  */

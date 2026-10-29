@@ -20,6 +20,12 @@ on:
       requires_action_label:
         type: string
         default: 'requires action'
+      block_labels:
+        description: >
+          Comma- or newline-separated labels that keep a PR out of the queue
+          even when it has the ready label.
+        type: string
+        default: 'dont merge,do not merge'
       tier1_labels:
         description: >
           Ordered comma- or newline-separated labels that focus dequeue
@@ -105,6 +111,7 @@ jobs:
           ready_label: ${{ inputs.ready_label }}
           processing_label: ${{ inputs.processing_label }}
           requires_action_label: ${{ inputs.requires_action_label }}
+          block_labels: ${{ inputs.block_labels }}
           tier1_labels: ${{ inputs.tier1_labels }}
           tier1_title_regex: ${{ inputs.tier1_title_regex }}
           tier2_title_regex: ${{ inputs.tier2_title_regex }}
@@ -137,6 +144,7 @@ jobs:
           ready_label: ${{ inputs.ready_label }}
           processing_label: ${{ inputs.processing_label }}
           requires_action_label: ${{ inputs.requires_action_label }}
+          block_labels: ${{ inputs.block_labels }}
           tier1_labels: ${{ inputs.tier1_labels }}
           tier1_title_regex: ${{ inputs.tier1_title_regex }}
           tier2_title_regex: ${{ inputs.tier2_title_regex }}
@@ -172,6 +180,7 @@ jobs:
           ready_label: ${{ inputs.ready_label }}
           processing_label: ${{ inputs.processing_label }}
           requires_action_label: ${{ inputs.requires_action_label }}
+          block_labels: ${{ inputs.block_labels }}
           tier1_labels: ${{ inputs.tier1_labels }}
           tier1_title_regex: ${{ inputs.tier1_title_regex }}
           tier2_title_regex: ${{ inputs.tier2_title_regex }}
@@ -202,6 +211,7 @@ jobs:
           ready_label: ${{ inputs.ready_label }}
           processing_label: ${{ inputs.processing_label }}
           requires_action_label: ${{ inputs.requires_action_label }}
+          block_labels: ${{ inputs.block_labels }}
           tier1_labels: ${{ inputs.tier1_labels }}
           tier1_title_regex: ${{ inputs.tier1_title_regex }}
           tier2_title_regex: ${{ inputs.tier2_title_regex }}
