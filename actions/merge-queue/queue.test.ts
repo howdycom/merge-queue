@@ -868,6 +868,18 @@ test('timeline with no ready label falls back to createdAt', () => {
   )
 })
 
+// Twice execFileSync's 1 MiB default. A long, comment-heavy PR returned a
+// ~1.1 MB first timeline page in production, and every dequeue pass died
+// with `spawnSync gh ENOBUFS` while that PR carried the ready label.
+const OVERSIZE_TIMELINE_BYTES = 2 * 1024 * 1024
+
+test('dequeue reads a timeline page larger than the default child-process buffer', () => {
+  check(
+    run('dequeue', world([pr(7, { timelinePadBytes: OVERSIZE_TIMELINE_BYTES })])),
+    /ready since 2026-01-02T00:00:00Z/,
+  )
+})
+
 
 const BLOCKED = [{ name: 'ready to merge' }, { name: 'dont merge' }]
 

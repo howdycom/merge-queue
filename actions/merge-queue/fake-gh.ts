@@ -21,6 +21,9 @@ export interface FakePr {
   autoMergeRequest?: { enabledBy: string } | null
   timeline?: Array<{ event: string; label?: { name: string }; created_at?: string }>
   timelineMode?: string
+  // Appends one `commented` event with a body this many bytes long, so a
+  // single timeline page can outgrow execFileSync's 1 MiB default buffer.
+  timelinePadBytes?: number
   checks?: Array<{ name: string; bucket: string; link?: string }>
   checksError?: string
   runs?: Record<string, string>
@@ -56,6 +59,7 @@ export interface FakeScenario {
   processingIssues?: unknown[]
 }
 
+const STDOUT_FD = 1
 const scenarioPath = process.env.GH_SCENARIO
 const logPath = process.env.GH_CALL_LOG
 if (!scenarioPath || !logPath) {
@@ -81,8 +85,11 @@ function fail(message: string, code = 1): never {
   process.exit(code)
 }
 
+// Write fd 1 synchronously: process.stdout.write to a pipe is async, and
+// the process.exit below cut every response off at 64 KiB, so the fake
+// could never return a page as large as real `gh` does.
 function ok(value?: unknown): never {
-  if (value !== undefined) process.stdout.write(typeof value === 'string' ? value : `${JSON.stringify(value)}\n`)
+  if (value !== undefined) writeFileSync(STDOUT_FD, typeof value === 'string' ? value : `${JSON.stringify(value)}\n`)
   save()
   process.exit(0)
 }
@@ -113,6 +120,12 @@ function endpoint(): string {
   return args.find((arg) => arg.startsWith('repos/')) || ''
 }
 
+function timelineOf(item: Pick<FakePr, 'timeline' | 'timelinePadBytes'>): unknown[] {
+  const events: unknown[] = [...(item.timeline || [])]
+  if (item.timelinePadBytes) events.push({ event: 'commented', body: 'x'.repeat(item.timelinePadBytes) })
+  return events
+}
+
 function readStdin(): string {
   return readFileSync(0, 'utf8')
 }
@@ -132,9 +145,9 @@ if (args[0] === 'api' && args.includes('--paginate') && args.includes('--slurp')
   if (scenario.slurpResult !== undefined) ok(scenario.slurpResult)
   const path = endpoint()
   const number = path.match(/\/issues\/(\d+)\/timeline/)?.[1]
-  const item: Pick<FakePr, 'timeline' | 'timelineMode'> = number ? pr(number) : { timeline: [] }
+  const item: Pick<FakePr, 'timeline' | 'timelineMode' | 'timelinePadBytes'> = number ? pr(number) : { timeline: [] }
   if (item.timelineMode === 'object') ok({ unexpected: true })
-  ok([item.timeline || []])
+  ok([timelineOf(item)])
 }
 
 if (args[0] === 'api' && args.includes('-X')) {
@@ -211,7 +224,7 @@ if (args[0] === 'api') {
       const page = Number(new URL(`https://example/${path}`).searchParams.get('page') || '1')
       ok(Array.from({ length: 100 }, (_, index) => ({ event: 'labeled', label: { name: 'ready to merge' }, created_at: `2026-01-01T00:${String(index).padStart(2, '0')}:00Z`, page })))
     }
-    ok(item.timeline || [])
+    ok(timelineOf(item))
   }
   if (path.includes('/actions/runs/')) {
     const runId = pathNumber(path, /\/runs\/(\d+)/)
