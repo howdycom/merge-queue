@@ -181,6 +181,13 @@ const MAX_CHECK_RERUN_ATTEMPTS = 2
 // Regex matching the two phrasings GitHub returns when update-branch is a
 // no-op because the head is already current with the base.
 const ALREADY_UP_TO_DATE_RE = /up.to.date|not.*behind|no new commits on the base branch/i
+// Ceiling on one `gh` call's buffered stdout/stderr. execFileSync defaults to
+// 1 MiB and kills the child with ENOBUFS past it. Production evidence
+// (2026-11-09): a long, comment-heavy PR's first timeline page
+// (`issues/<n>/timeline?per_page=100`) was ~1.1 MB, so every dequeue and
+// watchdog pass died in getReadySince while that PR carried the ready label,
+// and nothing behind it merged. 64 MiB leaves ample headroom for one REST page.
+const GH_MAX_BUFFER_BYTES = 64 * 1024 * 1024
 
 function requireEnv(name: string): string {
   const value = process.env[name]
@@ -190,7 +197,12 @@ function requireEnv(name: string): string {
 
 function sh(args: string[], envOverride?: Record<string, string | undefined>): string {
   const env = envOverride ? { ...process.env, ...envOverride } : process.env
-  return execFileSync(args[0], args.slice(1), { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], env }).trim()
+  return execFileSync(args[0], args.slice(1), {
+    encoding: 'utf-8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env,
+    maxBuffer: GH_MAX_BUFFER_BYTES,
+  }).trim()
 }
 
 function gh(args: string[]): string {
@@ -219,6 +231,7 @@ function ghApiJson(method: string, endpoint: string, body: unknown): string {
       input: JSON.stringify(body),
       stdio: ['pipe', 'pipe', 'pipe'],
       env: process.env,
+      maxBuffer: GH_MAX_BUFFER_BYTES,
     },
   ).trim()
 }
