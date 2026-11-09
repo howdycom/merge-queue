@@ -102,7 +102,7 @@ jobs:
       statuses: read
     steps:
       - name: Dequeue next PR
-        uses: howdycom/merge-queue/actions/merge-queue@679cb62aa5add3aa45f41ff59da7308e15d3285c
+        uses: howdycom/merge-queue/actions/merge-queue@9c3e23cdb587cdc99f28bc2b3cc98559e75e4a09
         with:
           command: dequeue
           github_token: ${{ secrets.merge_queue_pat || github.token }}
@@ -135,7 +135,7 @@ jobs:
       statuses: read
     steps:
       - name: Check in-flight PR's required checks
-        uses: howdycom/merge-queue/actions/merge-queue@679cb62aa5add3aa45f41ff59da7308e15d3285c
+        uses: howdycom/merge-queue/actions/merge-queue@9c3e23cdb587cdc99f28bc2b3cc98559e75e4a09
         with:
           command: check-completion
           github_token: ${{ secrets.merge_queue_pat || github.token }}
@@ -171,7 +171,7 @@ jobs:
       statuses: read
     steps:
       - name: Handle in-flight PR closed / unlabeled / synchronize
-        uses: howdycom/merge-queue/actions/merge-queue@679cb62aa5add3aa45f41ff59da7308e15d3285c
+        uses: howdycom/merge-queue/actions/merge-queue@9c3e23cdb587cdc99f28bc2b3cc98559e75e4a09
         with:
           command: cleanup
           github_token: ${{ secrets.merge_queue_pat || github.token }}
@@ -202,7 +202,7 @@ jobs:
       statuses: read
     steps:
       - name: Maintain in-flight PR / soft-requeue / evict / idle dequeue
-        uses: howdycom/merge-queue/actions/merge-queue@679cb62aa5add3aa45f41ff59da7308e15d3285c
+        uses: howdycom/merge-queue/actions/merge-queue@9c3e23cdb587cdc99f28bc2b3cc98559e75e4a09
         with:
           command: watchdog
           github_token: ${{ secrets.merge_queue_pat || github.token }}
