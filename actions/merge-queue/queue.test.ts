@@ -942,3 +942,104 @@ test('dry-run only logs the auto-merge disable', () => {
   check(result, /\[dry-run\] would disable auto-merge on PR #1/)
   assert.equal(result.scenario.prs[0].autoMergeRequest.enabledBy, 'queue')
 })
+
+function disableCalls(result: RunResult): string[] {
+  return [...result.stdout.matchAll(/disable auto-merge on PR #(\d+)/g)].map((match) => match[1])
+}
+
+test('a soft-requeued PR has its auto-merge turned off', () => {
+  const result = run('dequeue', {
+    ...world([pr(7, { reviewDecision: 'REVIEW_REQUIRED' })]),
+    ...claimed(7),
+  })
+  check(result, /needs an approving review/)
+  assert.equal(result.scenario.prs[0].autoMergeRequest, null)
+  assert.equal(result.scenario.stateFile.json.MERGE_QUEUE_PR, undefined)
+})
+
+test('an evicted PR has its auto-merge turned off', () => {
+  const result = run('dequeue', {
+    ...world([pr(7, { reviewDecision: 'CHANGES_REQUESTED' })]),
+    ...claimed(7),
+  })
+  check(result, /Evicting PR #7/)
+  assert.equal(result.scenario.prs[0].autoMergeRequest, null)
+})
+
+test('a soft-requeued PR gets auto-merge back when it is claimed again', () => {
+  // Pass 1: the watchdog soft-requeues stale #7; nothing else is ready.
+  const first = run('watchdog', {
+    ...world([pr(7, { checks: [{ name: 'slow', bucket: 'pending', link: '' }] })]),
+    ...claimed(7),
+  }, { MQ_STALE_AFTER_MINUTES: '0' })
+  check(first, /Soft-requeueing/)
+  assert.equal(first.scenario.prs[0].autoMergeRequest, null)
+  // Pass 2: the next dequeue re-claims it and re-arms auto-merge.
+  const second = run('dequeue', first.scenario)
+  check(second, /Now watching PR #7/)
+  assert.equal(second.scenario.stateFile.json.MERGE_QUEUE_PR, '7')
+  assert.equal(second.scenario.prs[0].autoMergeRequest.enabledBy, 'queue')
+})
+
+test('synchronize on a block-labeled in-flight PR releases it instead of re-arming', () => {
+  const result = run('cleanup', {
+    ...world([pr(7, { labels: [...BLOCKED, { name: 'merge-queue: processing' }], headRefOid: 'sha-sync' }), pr(8)]),
+    ...claimed(7),
+  }, { MQ_EVENT_PR_NUMBER: '7', MQ_EVENT_ACTION: 'synchronize' })
+  check(result, /In-flight PR #7 is labeled `dont merge`. Releasing the claim/)
+  assert.doesNotMatch(result.stdout, /Now watching PR #7/)
+  assert.doesNotMatch(result.stdout, /enable auto-merge \(--squash\) on PR #7/)
+  assert.equal(result.scenario.prs[0].autoMergeRequest, null)
+  assert.deepEqual(result.scenario.prs[0].labels, BLOCKED)
+  // The queue advanced to the next ready PR.
+  assert.equal(result.scenario.stateFile.json.MERGE_QUEUE_PR, '8')
+})
+
+test('dequeue disables auto-merge on blocked PRs queued behind the claimed one', () => {
+  const result = run('dequeue', world([
+    pr(1, { labels: BLOCKED }),
+    pr(2, { autoMergeRequest: null }),
+    pr(3, { labels: BLOCKED }),
+    pr(4, { labels: BLOCKED, autoMergeRequest: null }),
+    pr(5, { labels: BLOCKED }),
+  ]))
+  check(result, /Now watching PR #2/)
+  assert.equal(result.scenario.stateFile.json.MERGE_QUEUE_PR, '2')
+  // One disable per armed blocked PR, none for the unarmed #4.
+  assert.deepEqual(disableCalls(result), ['1', '3', '5'])
+  for (const index of [0, 2, 3, 4]) assert.equal(result.scenario.prs[index].autoMergeRequest, null)
+  assert.equal(result.scenario.prs[1].autoMergeRequest.enabledBy, 'queue')
+})
+
+test('a normal claimed PR still gets auto-merge with blocked PRs in the queue', () => {
+  const result = run('dequeue', world([
+    pr(1, { autoMergeRequest: null }),
+    pr(2, { labels: BLOCKED }),
+  ]))
+  check(result, /enable auto-merge \(--squash\) on PR #1/)
+  assert.equal(result.scenario.prs[0].autoMergeRequest.enabledBy, 'queue')
+  assert.deepEqual(disableCalls(result), ['2'])
+})
+
+test('a blocked in-flight PR keeps its claim when auto-merge cannot be disabled', () => {
+  const result = run('dequeue', {
+    ...world([pr(7, { labels: BLOCKED }), pr(8)]),
+    ...claimed(7),
+    mergeError: 'gh exploded',
+  })
+  check(result, /Keeping the claim so the next pass retries/)
+  assert.equal(result.scenario.stateFile.json.MERGE_QUEUE_PR, '7')
+  assert.match(result.scenario.prs[0].labels.map((label: { name: string }) => label.name).join(','), /dont merge/)
+  assert.doesNotMatch(result.stdout, /Paused by the merge queue/)
+})
+
+test('a blocked in-flight PR with no auto-merge is released without a disable call', () => {
+  const result = run('check-completion', {
+    ...world([pr(7, { labels: BLOCKED, autoMergeRequest: null })]),
+    ...claimed(7),
+    mergeError: 'gh exploded',
+  })
+  check(result, /In-flight PR #7 is labeled `dont merge`. Releasing the claim/)
+  assert.deepEqual(disableCalls(result), [])
+  assert.equal(result.scenario.stateFile.json.MERGE_QUEUE_PR, undefined)
+})
