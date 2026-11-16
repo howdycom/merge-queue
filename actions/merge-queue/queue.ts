@@ -391,15 +391,19 @@ function enableAutoMerge(prNumber: PrNumber): void {
   }
 }
 
-function disableAutoMerge(prNumber: PrNumber): void {
+// Returns false when the gh call failed, so releaseBlocked can keep its
+// claim and retry on the next pass instead of walking away from a PR that
+// GitHub may still merge.
+function disableAutoMerge(prNumber: PrNumber): boolean {
   logAction(`disable auto-merge on PR #${prNumber}`)
-  if (DRY_RUN) return
+  if (DRY_RUN) return true
   try {
     gh(['pr', 'merge', String(prNumber), '--disable-auto'])
+    return true
   } catch (err) {
-    // Transient gh failure: stay green. The PR is no longer claimed, and the
-    // next dequeue pass that sees the block label retries this.
+    // Transient gh failure: stay green. Each caller says who retries it.
     log(`Warning: could not disable auto-merge on PR #${prNumber}: ${errorText(err).split('\n')[0]}`)
+    return false
   }
 }
 
@@ -408,9 +412,23 @@ function disableAutoMerge(prNumber: PrNumber): void {
 // so removing it puts the PR straight back in line. Auto-merge has to go:
 // the queue armed it at claim time, and GitHub would otherwise merge the
 // PR the moment its checks pass, block label or not.
-async function releaseBlocked(prNumber: PrNumber, blockLabel: string, depth = 0): Promise<void> {
+//
+// If the disable fails, the claim stays. Once released, a PR is only seen
+// again by a dequeue that lists ready PRs, and dequeue lists nothing while
+// another PR is in flight -- so a released PR could keep auto-merge armed
+// for a whole flight. Keeping the claim means the next maintainInFlight /
+// check-completion / watchdog pass sees the block label and retries. When
+// auto-merge is not armed (autoMergeArmed=false) there is nothing to
+// disable, and skipping the call keeps a gh error on a no-op from holding
+// the queue.
+async function releaseBlocked(prNumber: PrNumber, blockLabel: string, autoMergeArmed: boolean, depth = 0): Promise<void> {
+  if (autoMergeArmed && !disableAutoMerge(prNumber)) {
+    log(
+      `In-flight PR #${prNumber} is labeled \`${blockLabel}\` but its auto-merge could not be disabled. Keeping the claim so the next pass retries.`,
+    )
+    return
+  }
   log(`In-flight PR #${prNumber} is labeled \`${blockLabel}\`. Releasing the claim and advancing the queue.`)
-  disableAutoMerge(prNumber)
   removeLabel(prNumber, PROCESSING_LABEL)
   clearYieldCount(prNumber)
   clearQueueState()
@@ -442,6 +460,11 @@ async function resolveMergeable(prNumber: PrNumber, initialMergeable: string): P
 
 async function evict(prNumber: PrNumber, reason: string, depth = 0): Promise<void> {
   log(`Evicting PR #${prNumber}: ${reason}`)
+  // The queue armed auto-merge at claim time. Left on, GitHub merges the
+  // evicted PR as soon as its checks pass, outside the queue and past any
+  // block label added later. Best-effort: an evicted PR loses READY_LABEL,
+  // so nothing retries a failed disable; the warning is the evidence.
+  disableAutoMerge(prNumber)
   removeLabel(prNumber, READY_LABEL)
   removeLabel(prNumber, PROCESSING_LABEL)
   clearYieldCount(prNumber)
@@ -481,6 +504,13 @@ async function softRequeueToBack(prNumber: PrNumber, body: string, depth = 0): P
   // (avoids a double-dequeue race with the explicit dequeue() below).
   removeLabel(prNumber, PROCESSING_LABEL)
   clearQueueState()
+  // Same reason as evict(): auto-merge armed at claim time would otherwise
+  // let GitHub merge this unclaimed PR out of turn. Production evidence
+  // (2026-11-10): 7 unclaimed ready PRs in one consumer repo still had
+  // auto-merge on after soft-requeues. updateBranchAndWatch re-arms it when
+  // the PR is claimed again. Best-effort, like evict(): the next claim
+  // re-arms it anyway, so a failed disable only risks an out-of-turn merge.
+  disableAutoMerge(prNumber)
   removeLabel(prNumber, READY_LABEL)
   // Re-add ready so it stays in the queue. Guarded: if the re-add fails
   // after the remove succeeded, the PR would otherwise silently leave the
@@ -839,7 +869,7 @@ async function maintainInFlight(prNumber: PrNumber, depth = 0): Promise<void> {
 
   const inFlightBlockLabel = findBlockLabel(snap.labels, BLOCK_LABELS)
   if (inFlightBlockLabel) {
-    await releaseBlocked(prNumber, inFlightBlockLabel, depth)
+    await releaseBlocked(prNumber, inFlightBlockLabel, Boolean(snap.autoMergeRequest), depth)
     return
   }
 
@@ -1022,15 +1052,22 @@ async function dequeue(depth = 0, excludePr = ''): Promise<void> {
   // the watchdog's stale timer fires. Production evidence (2026-07-21):
   // dequeue claimed #3614 -- ready-labeled but CHANGES_REQUESTED since
   // 07-14 -- and the queue merged nothing for the next several hours.
+  //
+  // Disarm every blocked candidate first, not just the ones ahead of the
+  // claim: the walk below returns at the first claim, and auto-merge may
+  // still be armed from an earlier claim or by hand -- GitHub honors it
+  // whether or not the queue claims the PR. This also retries a disable
+  // that failed on an earlier pass. The list already carries
+  // autoMergeRequest, so the only extra call is the disable itself.
+  for (const item of withMeta) {
+    if (item.autoMergeRequest && findBlockLabel(item.labels, BLOCK_LABELS)) disableAutoMerge(item.number)
+  }
   for (const next of withMeta) {
     const blockLabel = findBlockLabel(next.labels, BLOCK_LABELS)
     if (blockLabel) {
       log(
         `Skipping PR #${next.number} "${next.title}": labeled \`${blockLabel}\`. It stays queued and becomes eligible once that label is removed.`,
       )
-      // Auto-merge may still be armed from an earlier claim or by hand, and
-      // GitHub honors it whether or not the queue claims the PR.
-      if (next.autoMergeRequest) disableAutoMerge(next.number)
       continue
     }
     if (next.isDraft) {
@@ -1117,7 +1154,7 @@ async function checkCompletion(): Promise<void> {
   // last pass before native auto-merge fires on green checks.
   const blockLabel = findBlockLabel(snap.labels, BLOCK_LABELS)
   if (blockLabel) {
-    await releaseBlocked(pr, blockLabel)
+    await releaseBlocked(pr, blockLabel, Boolean(snap.autoMergeRequest))
     return
   }
 
@@ -1246,11 +1283,26 @@ async function cleanup(): Promise<void> {
   // PR (update-branch → synchronize webhook → cleanup → dequeue → claim
   // again). That double-claimed every successful update, raced with
   // check-completion, and reset state unnecessarily. On synchronize we only
-  // need to track the new head SHA and keep auto-merge armed.
+  // need to track the new head SHA and keep auto-merge armed -- unless the
+  // PR now carries a block label: re-arming here would let GitHub merge a
+  // `dont merge` PR the moment its checks pass, so release it the way
+  // maintainInFlight does instead.
   if (EVENT_ACTION === 'synchronize') {
     log(`Synchronize on in-flight PR #${EVENT_PR_NUMBER}; refreshing watched SHA (keeping claim).`)
     if (DRY_RUN) return
-    const head = ghJson<{ headRefOid: string }>(['pr', 'view', EVENT_PR_NUMBER, '--json', 'headRefOid']).headRefOid
+    const synced = ghJson<Pick<PrSnapshot, 'headRefOid' | 'labels' | 'autoMergeRequest'>>([
+      'pr',
+      'view',
+      EVENT_PR_NUMBER,
+      '--json',
+      'headRefOid,labels,autoMergeRequest',
+    ])
+    const blockLabel = findBlockLabel(synced.labels, BLOCK_LABELS)
+    if (blockLabel) {
+      await releaseBlocked(EVENT_PR_NUMBER, blockLabel, Boolean(synced.autoMergeRequest))
+      return
+    }
+    const head = synced.headRefOid
     setVar('MERGE_QUEUE_SHA', head)
     enableAutoMerge(EVENT_PR_NUMBER)
     log(`Now watching PR #${EVENT_PR_NUMBER} at ${head}.`)
