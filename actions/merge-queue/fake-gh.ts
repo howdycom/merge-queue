@@ -18,6 +18,10 @@ export interface FakePr {
   mergeStateStatus?: string
   headRefOid?: string
   headAfterUpdate?: string
+  // undefined means the opt-in CI tier guard sees success. null means the
+  // commit has no such status. A string is that status's state.
+  ciTierState?: string | null
+  ciTierError?: string
   autoMergeRequest?: { enabledBy: string } | null
   timeline?: Array<{ event: string; label?: { name: string }; created_at?: string }>
   timelineMode?: string
@@ -225,6 +229,18 @@ if (args[0] === 'api') {
       ok(Array.from({ length: 100 }, (_, index) => ({ event: 'labeled', label: { name: 'ready to merge' }, created_at: `2026-01-01T00:${String(index).padStart(2, '0')}:00Z`, page })))
     }
     ok(timelineOf(item))
+  }
+  const pullNumber = path.match(/\/pulls\/(\d+)$/)
+  if (pullNumber) {
+    ok({ head: { sha: pr(pullNumber[1]).headRefOid } })
+  }
+  const commitSha = path.match(/\/commits\/([^/]+)\/status$/)
+  if (commitSha) {
+    const item = (scenario.prs || []).find((candidate) => candidate.headRefOid === commitSha[1])
+    if (!item) fail(`unknown commit ${commitSha[1]}`)
+    if (item.ciTierError) fail(item.ciTierError)
+    if (item.ciTierState === null) ok({ statuses: [] })
+    ok({ statuses: [{ context: 'CI tier', state: item.ciTierState || 'success' }] })
   }
   if (path.includes('/actions/runs/')) {
     const runId = pathNumber(path, /\/runs\/(\d+)/)

@@ -8,7 +8,7 @@ Howdy repos (`astro-market`, `ai-matching-platform`, and others) were the first 
 
 ## Usage
 
-Reference the action and workflow by tag, not by branch:
+Reference the action and workflow by tag, not by branch. Callers that post a commit status for a deferred CI tier pass `ci_tier_context` (astro-market uses `CI tier`). `gh pr merge --auto` then waits until that status is `success`. Leave the input empty if the repository does not post the status. The caller's token needs `statuses: read` when the input is set.
 
 ```yaml
 - uses: howdycom/merge-queue/actions/merge-queue@v1

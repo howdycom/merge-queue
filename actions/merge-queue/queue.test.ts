@@ -481,6 +481,46 @@ test('removing a label warns on a non-404 and stays quiet on 404', () => {
   )
 })
 
+test('dequeue arms auto-merge when the opted-in CI tier status succeeded', () => {
+  const result = run(
+    'dequeue',
+    world([pr(7, { autoMergeRequest: null, ciTierState: 'success' })]),
+    { MQ_CI_TIER_CONTEXT: 'CI tier' },
+  )
+  check(result, /enable auto-merge \(--squash\) on PR #7/)
+  assert.equal(result.scenario.prs[0].autoMergeRequest.enabledBy, 'queue')
+})
+
+test('dequeue still updates the branch but does not arm auto-merge while CI tier is pending', () => {
+  const result = run(
+    'dequeue',
+    world([pr(7, { autoMergeRequest: null, ciTierState: 'pending' })]),
+    { MQ_CI_TIER_CONTEXT: 'CI tier' },
+  )
+  check(result, /CI tier is pending/)
+  check(result, /Now watching PR #7 at sha-7-next/)
+  assert.equal(result.scenario.prs[0].autoMergeRequest, null)
+  assert.doesNotMatch(result.stdout, /enable auto-merge/)
+})
+
+test('dequeue does not arm auto-merge when the CI tier status is missing or the lookup fails', () => {
+  const missing = run(
+    'dequeue',
+    world([pr(7, { autoMergeRequest: null, ciTierState: null })]),
+    { MQ_CI_TIER_CONTEXT: 'CI tier' },
+  )
+  check(missing, /CI tier is missing/)
+  assert.equal(missing.scenario.prs[0].autoMergeRequest, null)
+
+  const failed = run(
+    'dequeue',
+    world([pr(8, { autoMergeRequest: null, ciTierError: 'status api down' })]),
+    { MQ_CI_TIER_CONTEXT: 'CI tier' },
+  )
+  check(failed, /could not read CI tier on PR #8/)
+  assert.equal(failed.scenario.prs[0].autoMergeRequest, null)
+})
+
 test('auto-merge failure is logged and the claim continues', () => {
   check(
     run('dequeue', world([pr(7, { autoMergeRequest: null }), ]), { }),

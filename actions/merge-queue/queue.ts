@@ -114,6 +114,9 @@ const REPO = requireEnv('GITHUB_REPOSITORY')
 const COMMAND = requireEnv('MQ_COMMAND')
 const TARGET_BRANCH = process.env.MQ_TARGET_BRANCH || ''
 const MERGE_METHOD = process.env.MQ_MERGE_METHOD || 'squash'
+// Empty unless the caller opts in. A shared queue must not refuse every
+// auto-merge because one consumer posts a `CI tier` commit status.
+const CI_TIER_CONTEXT = (process.env.MQ_CI_TIER_CONTEXT || '').trim()
 const READY_LABEL = process.env.MQ_READY_LABEL || 'ready to merge'
 const PROCESSING_LABEL = process.env.MQ_PROCESSING_LABEL || 'merge-queue: processing'
 const REQUIRES_ACTION_LABEL = process.env.MQ_REQUIRES_ACTION_LABEL || 'requires action'
@@ -375,7 +378,51 @@ function comment(prNumber: PrNumber, body: string): void {
   gh(['pr', 'comment', String(prNumber), '--body', body])
 }
 
+interface PullHeadResponse {
+  head: { sha: string }
+}
+
+interface CommitCombinedStatus {
+  statuses: Array<{ context: string; state: string }>
+}
+
+// The head SHA is the one `gh pr merge --auto` would merge now, which is
+// not MERGE_QUEUE_SHA: that variable is `pending` until update-branch
+// settles, and this call runs before update-branch.
+function readCiTierState(prNumber: PrNumber): string | null {
+  const pull = ghJson<PullHeadResponse>(['api', `repos/${REPO}/pulls/${prNumber}`])
+  const status = ghJson<CommitCombinedStatus>([
+    'api',
+    `repos/${REPO}/commits/${pull.head.sha}/status`,
+  ])
+  const match = status.statuses.find((item) => item.context === CI_TIER_CONTEXT)
+  return match ? match.state : null
+}
+
 function enableAutoMerge(prNumber: PrNumber): void {
+  // gh pr merge --auto merges immediately when mergeStateStatus is CLEAN,
+  // UNSTABLE, or HAS_HOOKS. An iterate-tier head is one of those while its
+  // cheap checks are green and `CI tier` is still pending. Refusing here
+  // leaves update-branch running; check-completion and maintainInFlight
+  // retry this call once a merge-tier run posts success. A failed lookup
+  // also refuses: arming auto-merge on an unknown status is the bug.
+  if (CI_TIER_CONTEXT) {
+    let tierState: string | null
+    try {
+      tierState = readCiTierState(prNumber)
+    } catch (err) {
+      log(
+        `Warning: could not read ${CI_TIER_CONTEXT} on PR #${prNumber}: ${errorText(err).split('\n')[0]}`,
+      )
+      return
+    }
+    if (tierState !== 'success') {
+      log(
+        `Not enabling auto-merge on PR #${prNumber}: ${CI_TIER_CONTEXT} is ${tierState || 'missing'}. Refusing gh pr merge --auto until that status is success.`,
+      )
+      return
+    }
+  }
   // Enabled here rather than trusted as a precondition: a PR that's
   // ready-labeled but never actually had auto-merge turned on would sit
   // fully green and just never merge, jamming the queue until the watchdog
