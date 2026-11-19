@@ -61,6 +61,9 @@ export interface FakeScenario {
   rerunError?: string
   reruns?: string[]
   processingIssues?: unknown[]
+  // Token (`GH_TOKEN`) seen by the CI tier head and status reads.
+  ciTierPullToken?: string
+  ciTierStatusToken?: string
 }
 
 const STDOUT_FD = 1
@@ -232,10 +235,12 @@ if (args[0] === 'api') {
   }
   const pullNumber = path.match(/\/pulls\/(\d+)$/)
   if (pullNumber) {
+    scenario.ciTierPullToken = process.env.GH_TOKEN || ''
     ok({ head: { sha: pr(pullNumber[1]).headRefOid } })
   }
   const commitSha = path.match(/\/commits\/([^/]+)\/status$/)
   if (commitSha) {
+    scenario.ciTierStatusToken = process.env.GH_TOKEN || ''
     const item = (scenario.prs || []).find((candidate) => candidate.headRefOid === commitSha[1])
     if (!item) fail(`unknown commit ${commitSha[1]}`)
     if (item.ciTierError) fail(item.ciTierError)

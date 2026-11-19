@@ -389,9 +389,16 @@ interface CommitCombinedStatus {
 // The head SHA is the one `gh pr merge --auto` would merge now, which is
 // not MERGE_QUEUE_SHA: that variable is `pending` until update-branch
 // settles, and this call runs before update-branch.
+//
+// Both reads use the job token (`MQ_GITHUB_TOKEN` / `github.token`).
+// `GH_TOKEN` is `inputs.github_token`. When that input is an app token
+// without Commit statuses, the combined-status API returns 403, the
+// catch below refuses, and every opted-in auto-merge stays off. The job
+// token already has `statuses: read` from the caller permissions block.
+// Empty `ci_tier_context` never reaches this function.
 function readCiTierState(prNumber: PrNumber): string | null {
-  const pull = ghJson<PullHeadResponse>(['api', `repos/${REPO}/pulls/${prNumber}`])
-  const status = ghJson<CommitCombinedStatus>([
+  const pull = ghJsonAsDefaultToken<PullHeadResponse>(['api', `repos/${REPO}/pulls/${prNumber}`])
+  const status = ghJsonAsDefaultToken<CommitCombinedStatus>([
     'api',
     `repos/${REPO}/commits/${pull.head.sha}/status`,
   ])
