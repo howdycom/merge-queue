@@ -8,7 +8,7 @@ Howdy repos (`astro-market`, `ai-matching-platform`, and others) were the first 
 
 ## Usage
 
-Reference the action and workflow by tag, not by branch. Callers that post a commit status for a deferred CI tier pass `ci_tier_context` (astro-market uses `CI tier`). `gh pr merge --auto` then waits until that status is `success`. Leave the input empty if the repository does not post the status. The caller's token needs `statuses: read` when the input is set.
+Reference the action and workflow by tag, not by branch. Callers that post a commit status for a deferred CI tier pass `ci_tier_context` (astro-market uses `CI tier`). `gh pr merge --auto` then waits until that status is `success`. Leave the input empty if the repository does not post the status. The lookup uses the job `github.token`, which callers already grant `statuses: read`. The `github_token` input does not need Commit statuses.
 
 ```yaml
 - uses: howdycom/merge-queue/actions/merge-queue@v1
@@ -146,7 +146,7 @@ Queue state is a JSON file on branch `merge-queue-state`. `GITHUB_TOKEN` can wri
 
 Verify **Contents** is actually granted *write* (not just read) before going live with `dry_run: false` — shadow mode never calls `update-branch` for real, so a missing or read-only Contents permission won't surface until the first live dequeue, and it fails in a way `dequeue()` used to misdiagnose as a merge conflict (see the code comment in `queue.ts` for the incident this came from).
 
-Required-check reads and cancelled-check re-runs use the job's default `GITHUB_TOKEN` (`MQ_GITHUB_TOKEN`) because a fine-grained PAT cannot read other Apps' check runs via GraphQL. The caller `permissions:` block caps what the called jobs can be granted: they need `checks: read`, `statuses: read`, `actions: write`, `pull-requests: write`, `issues: write`, and `contents: write`. With only `actions: read` the re-run degrades to a logged warning (the failed attempt still counts toward the cap, and the claim clock is deliberately not refreshed when nothing restarted, so recovery stays bounded by `stale_after_minutes` windows until the cap evicts).
+Required-check reads, the opted-in CI tier status read, and cancelled-check re-runs use the job's default `GITHUB_TOKEN` (`MQ_GITHUB_TOKEN`) because a fine-grained PAT cannot read other Apps' check runs via GraphQL, and an app token passed as `github_token` may not have Commit statuses. The caller `permissions:` block caps what the called jobs can be granted: they need `checks: read`, `statuses: read`, `actions: write`, `pull-requests: write`, `issues: write`, and `contents: write`. With only `actions: read` the re-run degrades to a logged warning (the failed attempt still counts toward the cap, and the claim clock is deliberately not refreshed when nothing restarted, so recovery stays bounded by `stale_after_minutes` windows until the cap evicts).
 
 ## Versioning
 

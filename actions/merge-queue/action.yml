@@ -34,7 +34,9 @@ inputs:
       post this status keep merging. astro-market passes `CI tier`: `gh pr
       merge --auto` merges immediately when the pull request is CLEAN,
       UNSTABLE, or HAS_HOOKS, and an iterate-tier head is one of those until
-      that status is success. The caller token needs `statuses: read`.
+      that status is success. The lookup uses the job `github.token`
+      (`MQ_GITHUB_TOKEN`), which already has `statuses: read`. The
+      `github_token` input does not need Commit statuses.
     required: false
     default: ''
   ready_label:

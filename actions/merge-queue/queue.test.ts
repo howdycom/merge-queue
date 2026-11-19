@@ -489,6 +489,9 @@ test('dequeue arms auto-merge when the opted-in CI tier status succeeded', () =>
   )
   check(result, /enable auto-merge \(--squash\) on PR #7/)
   assert.equal(result.scenario.prs[0].autoMergeRequest.enabledBy, 'queue')
+  // Job token, not GH_TOKEN (`test-token` / inputs.github_token).
+  assert.equal(result.scenario.ciTierPullToken, 'gha-token')
+  assert.equal(result.scenario.ciTierStatusToken, 'gha-token')
 })
 
 test('dequeue still updates the branch but does not arm auto-merge while CI tier is pending', () => {
@@ -501,6 +504,19 @@ test('dequeue still updates the branch but does not arm auto-merge while CI tier
   check(result, /Now watching PR #7 at sha-7-next/)
   assert.equal(result.scenario.prs[0].autoMergeRequest, null)
   assert.doesNotMatch(result.stdout, /enable auto-merge/)
+})
+
+test('dequeue does not arm auto-merge when the job token cannot read commit statuses', () => {
+  const result = run(
+    'dequeue',
+    world([pr(7, { autoMergeRequest: null, ciTierState: 'success' })]),
+    { MQ_CI_TIER_CONTEXT: 'CI tier', MQ_GITHUB_TOKEN: '' },
+  )
+  check(result, /could not read CI tier on PR #7/)
+  check(result, /Now watching PR #7 at sha-7-next/)
+  assert.equal(result.scenario.prs[0].autoMergeRequest, null)
+  assert.doesNotMatch(result.stdout, /enable auto-merge/)
+  assert.equal(result.scenario.ciTierStatusToken, undefined)
 })
 
 test('dequeue does not arm auto-merge when the CI tier status is missing or the lookup fails', () => {
