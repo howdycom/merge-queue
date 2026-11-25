@@ -140,6 +140,13 @@ const DEPRIORITIZED_AUTHORS = parseLabelList(
   'dependabot,dependabot[bot],app/dependabot',
 )
 const STALE_AFTER_MINUTES = Number(process.env.MQ_STALE_AFTER_MINUTES || '90')
+// Opt-in. Default off so other callers keep the 90-minute BLOCKED wait.
+// When true: dequeue skips a candidate whose required checks are already
+// `fail`, and watchdog evicts that in-flight PR on the current tick
+// instead of waiting for STALE_AFTER_MINUTES. Pending/cancelled required
+// checks are unchanged. Do not emulate this by setting stale_after_minutes
+// to 5 — that also yields slow pending E2E.
+const EVICT_ON_REQUIRED_FAIL = process.env.MQ_EVICT_ON_REQUIRED_FAIL === 'true'
 const EVENT_PR_NUMBER = process.env.MQ_EVENT_PR_NUMBER || ''
 const EVENT_ACTION = process.env.MQ_EVENT_ACTION || ''
 const DRY_RUN = process.env.MQ_DRY_RUN === 'true'
@@ -261,6 +268,21 @@ function ghAsDefaultToken(args: string[]): string {
 
 function ghJsonAsDefaultToken<T = unknown>(args: string[]): T {
   return JSON.parse(ghAsDefaultToken(args))
+}
+
+function requiredFailMessage(names: string): string {
+  return `Required check(s) failed after updating with \`${TARGET_BRANCH}\`: ${names}. This may mean the change needs adjusting for the latest \`${TARGET_BRANCH}\`, or it's an unrelated flake -- check the failing job(s) before re-adding the label.`
+}
+
+/** Required checks in bucket `fail`, or `null` when the read itself failed. */
+function requiredFailingNames(pr: PrNumber): string[] | null {
+  try {
+    const checks = ghJsonAsDefaultToken<GhCheck[]>(['pr', 'checks', pr, '--required', '--json', 'name,bucket,link'])
+    return checks.filter((c) => c.bucket === 'fail').map((c) => c.name)
+  } catch (err) {
+    log(`Could not read required checks for PR #${pr}: ${errorText(err).split('\n')[0]}.`)
+    return null
+  }
 }
 
 // Fetch every page of a GitHub REST *list* endpoint as one flat array.
@@ -1148,6 +1170,15 @@ async function dequeue(depth = 0, excludePr = ''): Promise<void> {
       )
       continue
     }
+    if (EVICT_ON_REQUIRED_FAIL) {
+      const failing = requiredFailingNames(next.number)
+      if (failing && failing.length > 0) {
+        log(
+          `Skipping PR #${next.number} "${next.title}": required check(s) failed (${failing.join(', ')}). It stays queued and becomes eligible once those required checks recover.`,
+        )
+        continue
+      }
+    }
 
     log(
       `Dequeuing PR #${next.number} "${next.title}" (tier ${next.tier}, created ${next.createdAt}, yields ${next.yieldCount || 0}, ready since ${next.readySince})`,
@@ -1320,10 +1351,7 @@ async function checkCompletion(): Promise<void> {
   }
 
   const names = failing.map((c) => c.name).join(', ')
-  await evict(
-    pr,
-    `Required check(s) failed after updating with \`${TARGET_BRANCH}\`: ${names}. This may mean the change needs adjusting for the latest \`${TARGET_BRANCH}\`, or it's an unrelated flake -- check the failing job(s) before re-adding the label.`,
-  )
+  await evict(pr, requiredFailMessage(names))
 }
 
 async function cleanup(): Promise<void> {
@@ -1409,6 +1437,14 @@ async function watchdog(): Promise<void> {
   if (!stillPr || !stillClaimedAt) {
     log('Queue is idle after maintainInFlight. Done.')
     return
+  }
+
+  if (EVICT_ON_REQUIRED_FAIL) {
+    const failing = requiredFailingNames(stillPr)
+    if (failing && failing.length > 0) {
+      await evict(stillPr, requiredFailMessage(failing.join(', ')))
+      return
+    }
   }
 
   const elapsedMinutes = (Date.now() - new Date(stillClaimedAt).getTime()) / 60000

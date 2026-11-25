@@ -96,6 +96,14 @@ inputs:
     description: 'For the watchdog command: evict the in-flight PR if it has been claimed longer than this with no resolution.'
     required: false
     default: '90'
+  evict_on_required_fail:
+    description: >
+      Opt-in. When true, dequeue skips a PR whose required checks are already
+      fail, and watchdog evicts that in-flight PR on the current tick instead
+      of waiting for stale_after_minutes. Default false so other callers keep
+      the 90-minute wait. Pending required checks are unchanged.
+    required: false
+    default: 'false'
   event_pr_number:
     description: 'For the cleanup command: github.event.pull_request.number from the triggering event.'
     required: false
@@ -283,6 +291,7 @@ runs:
         MQ_DEPRIORITIZED_TITLE_REGEX: ${{ inputs.deprioritized_title_regex }}
         MQ_DEPRIORITIZED_AUTHORS: ${{ inputs.deprioritized_authors }}
         MQ_STALE_AFTER_MINUTES: ${{ inputs.stale_after_minutes }}
+        MQ_EVICT_ON_REQUIRED_FAIL: ${{ inputs.evict_on_required_fail }}
         MQ_EVENT_PR_NUMBER: ${{ inputs.event_pr_number }}
         MQ_EVENT_ACTION: ${{ inputs.event_action }}
         MQ_DRY_RUN: ${{ inputs.dry_run }}

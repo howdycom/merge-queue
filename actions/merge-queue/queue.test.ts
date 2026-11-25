@@ -810,6 +810,105 @@ test('watchdog dequeues when idle and waits out a fresh claim', () => {
   )
 })
 
+test('dequeue still claims a required-fail PR when evict_on_required_fail is off', () => {
+  const result = run(
+    'dequeue',
+    world([pr(7, { checks: [{ name: 'e2e-tests', bucket: 'fail', link: '' }] })]),
+  )
+  check(result, /Now watching PR #7/)
+  assert.equal(result.scenario.stateFile.json.MERGE_QUEUE_PR, '7')
+})
+
+test('dequeue skips a required-fail PR when evict_on_required_fail is on and claims the next', () => {
+  const result = run(
+    'dequeue',
+    world([
+      pr(1, {
+        createdAt: '2026-01-01T00:00:00Z',
+        checks: [{ name: 'e2e-tests', bucket: 'fail', link: '' }],
+      }),
+      pr(2, { autoMergeRequest: null }),
+    ]),
+    { MQ_EVICT_ON_REQUIRED_FAIL: 'true' },
+  )
+  check(result, /Skipping PR #1 "PR 1": required check\(s\) failed \(e2e-tests\)/)
+  assert.equal(result.scenario.stateFile.json.MERGE_QUEUE_PR, '2')
+})
+
+test('dequeue claims when evict_on_required_fail is on but required checks cannot be read', () => {
+  const result = run(
+    'dequeue',
+    world([pr(7, { checks: [{ name: 'e2e-tests', bucket: 'fail', link: '' }] })]),
+    { MQ_EVICT_ON_REQUIRED_FAIL: 'true', MQ_GITHUB_TOKEN: '' },
+  )
+  check(result, /Could not read required checks for PR #7/)
+  check(result, /Now watching PR #7/)
+})
+
+test('dequeue still claims a pending required check when evict_on_required_fail is on', () => {
+  const result = run(
+    'dequeue',
+    world([pr(7, { checks: [{ name: 'e2e', bucket: 'pending', link: '' }] })]),
+    { MQ_EVICT_ON_REQUIRED_FAIL: 'true' },
+  )
+  check(result, /Now watching PR #7/)
+})
+
+test('watchdog evicts a fresh required-fail claim when evict_on_required_fail is on', () => {
+  check(
+    run(
+      'watchdog',
+      {
+        ...world([pr(7, { checks: [{ name: 'e2e-tests', bucket: 'fail', link: '' }] })]),
+        ...claimed(7, { MERGE_QUEUE_CLAIMED_AT: new Date().toISOString() }),
+      },
+      { MQ_EVICT_ON_REQUIRED_FAIL: 'true' },
+    ),
+    /Required check\(s\) failed after updating with `develop`: e2e-tests/,
+  )
+})
+
+test('watchdog leaves a fresh required-fail claim seated when evict_on_required_fail is off', () => {
+  check(
+    run(
+      'watchdog',
+      {
+        ...world([pr(7, { checks: [{ name: 'e2e-tests', bucket: 'fail', link: '' }] })]),
+        ...claimed(7, { MERGE_QUEUE_CLAIMED_AT: new Date().toISOString() }),
+      },
+    ),
+    /under the 90m threshold/,
+  )
+})
+
+test('watchdog does not evict pending required checks early when evict_on_required_fail is on', () => {
+  check(
+    run(
+      'watchdog',
+      {
+        ...world([pr(7, { checks: [{ name: 'e2e', bucket: 'pending', link: '' }] })]),
+        ...claimed(7, { MERGE_QUEUE_CLAIMED_AT: new Date().toISOString() }),
+      },
+      { MQ_EVICT_ON_REQUIRED_FAIL: 'true' },
+    ),
+    /under the 90m threshold/,
+  )
+})
+
+test('watchdog stays under the stale window when required-check read fails with the flag on', () => {
+  check(
+    run(
+      'watchdog',
+      {
+        ...world([pr(7, { checks: [{ name: 'e2e-tests', bucket: 'fail', link: '' }] })]),
+        ...claimed(7, { MERGE_QUEUE_CLAIMED_AT: new Date().toISOString() }),
+      },
+      { MQ_EVICT_ON_REQUIRED_FAIL: 'true', MQ_GITHUB_TOKEN: '' },
+    ),
+    /under the 90m threshold/,
+  )
+})
+
 test('watchdog evicts a stale claim with failing checks', () => {
   check(
     run('watchdog', {
